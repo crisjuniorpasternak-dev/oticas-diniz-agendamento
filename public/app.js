@@ -118,6 +118,7 @@ async function iniciar() {
   const me = await api('GET', '/api/auth/me').catch(() => ({ usuario: null }));
   if (!me.usuario) {
     estado.usuario = null;
+    estado.demo = !!me.demo;
     return telaEntrada();
   }
   Object.assign(estado, { usuario: me.usuario, loja: me.loja, permissoes: me.permissoes });
@@ -163,10 +164,10 @@ function telaEntrada(modo = 'login') {
           <button class="btn" type="submit" style="width:100%">Entrar</button>
           <p class="suave" style="text-align:center">Ainda não tem conta? <a href="#" id="trocar">Cadastre-se para agendar</a></p>
         </form>
-        <div class="demo"><b>Acessos de demonstração</b> (senha <code>diniz123</code>):<br>
+        ${estado.demo ? `<div class="demo"><b>Acessos de demonstração</b> (senha <code>diniz123</code>):<br>
           <code>admin@diniz.com</code> · <code>gerente.centro@diniz.com</code><br>
           <code>atendente.centro@diniz.com</code> · <code>ana@diniz.com</code><br>
-          <code>cliente@exemplo.com</code></div>`
+          <code>cliente@exemplo.com</code></div>` : ''}`
           : `<form id="f">
           <h2>Criar conta</h2>
           <label>Nome completo<input name="nome" required></label>

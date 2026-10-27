@@ -107,7 +107,11 @@ function criarApp(db, { agora = () => new Date() } = {}) {
   });
 
   app.get('/api/auth/me', async (req, res) => {
-    if (!req.usuario) return res.json({ usuario: null });
+    if (!req.usuario) {
+      // Mostra os acessos de demonstração na tela de login só quando o banco é o de demonstração
+      const demo = !!(await db.get("SELECT 1 FROM usuarios WHERE email = 'cliente@exemplo.com'"));
+      return res.json({ usuario: null, demo });
+    }
     const loja = req.usuario.loja_id ? (await db.get('SELECT id, nome FROM lojas WHERE id = ?', req.usuario.loja_id)) : null;
     res.json({ usuario: usuarioPublico(req.usuario), loja, permissoes: PERMISSOES[req.usuario.perfil] });
   });
