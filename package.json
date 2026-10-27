@@ -1,0 +1,20 @@
+{
+  "name": "oticas-diniz-agendamento",
+  "version": "1.0.0",
+  "description": "Sistema de agendamento de exames de vista da Óticas Diniz, com hierarquia de acessos",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --no-warnings src/server.js",
+    "test": "node --no-warnings --test"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.22.3"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "private": true
+}
