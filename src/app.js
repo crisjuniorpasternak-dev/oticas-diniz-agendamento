@@ -3,7 +3,6 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const path = require('path');
 const bcrypt = require('bcryptjs');
-const { transacao } = require('./db');
 const { PERFIS, PERMISSOES, PODE_GERENCIAR, tem } = require('./permissoes');
 const agenda = require('./agenda');
 
@@ -34,10 +33,8 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     next();
   });
 
-  const auditar = (usuarioId, acao, entidade, entidadeId, detalhes) =>
-    db
-      .prepare('INSERT INTO auditoria (usuario_id, acao, entidade, entidade_id, detalhes) VALUES (?,?,?,?,?)')
-      .run(usuarioId ?? null, acao, entidade ?? null, entidadeId ?? null, detalhes ? JSON.stringify(detalhes) : null);
+  const auditar = async (usuarioId, acao, entidade, entidadeId, detalhes) =>
+    (await db.run('INSERT INTO auditoria (usuario_id, acao, entidade, entidade_id, detalhes) VALUES (?,?,?,?,?)', usuarioId ?? null, acao, entidade ?? null, entidadeId ?? null, detalhes ? JSON.stringify(detalhes) : null));
 
   const usuarioPublico = (u) =>
     u && {
@@ -56,15 +53,11 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     };
 
   // ---------- Autenticação ----------
-  app.use((req, res, next) => {
+  app.use(async (req, res, next) => {
     const token = req.cookies.sessao;
     if (token) {
-      const u = db
-        .prepare(
-          `SELECT u.* FROM sessoes s JOIN usuarios u ON u.id = s.usuario_id
-           WHERE s.token = ? AND s.expira_em > datetime('now') AND u.ativo = 1`
-        )
-        .get(token);
+      const u = (await db.get(`SELECT u.* FROM sessoes s JOIN usuarios u ON u.id = s.usuario_id
+           WHERE s.token = ? AND s.expira_em > datetime('now') AND u.ativo = 1`, token));
       if (u) req.usuario = u;
     }
     next();
@@ -77,12 +70,10 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       permissoes.some((p) => tem(req.usuario, p)) ? next() : res.status(403).json({ erro: 'Seu perfil não tem acesso a esta função.' }),
   ];
 
-  const abrirSessao = (res, usuarioId) => {
+  const abrirSessao = async (res, usuarioId) => {
     const token = crypto.randomBytes(32).toString('hex');
-    db.prepare(`INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, datetime('now', '+${DURACAO_SESSAO_H} hours'))`).run(
-      token,
-      usuarioId
-    );
+    (await db.run(`INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, datetime('now', '+${DURACAO_SESSAO_H} hours'))`, token,
+      usuarioId));
     res.cookie('sessao', token, {
       httpOnly: true,
       sameSite: 'lax',
@@ -92,50 +83,48 @@ function criarApp(db, { agora = () => new Date() } = {}) {
   };
 
   const tentativas = new Map(); // e-mail -> { n, ate }
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const email = String(req.body.email || '').trim().toLowerCase();
     const t = tentativas.get(email);
     if (t && t.ate > Date.now()) return res.status(429).json({ erro: 'Muitas tentativas. Aguarde alguns minutos.' });
-    const u = db.prepare('SELECT * FROM usuarios WHERE email = ?').get(email);
+    const u = (await db.get('SELECT * FROM usuarios WHERE email = ?', email));
     if (!u || !u.ativo || !bcrypt.compareSync(String(req.body.senha || ''), u.senha_hash)) {
       const n = (t?.n || 0) + 1;
       tentativas.set(email, { n, ate: n >= 5 ? Date.now() + 5 * 60 * 1000 : 0 });
       return res.status(401).json({ erro: 'E-mail ou senha inválidos.' });
     }
     tentativas.delete(email);
-    db.prepare("DELETE FROM sessoes WHERE expira_em <= datetime('now')").run();
-    abrirSessao(res, u.id);
-    auditar(u.id, 'login', 'usuario', u.id);
+    (await db.run("DELETE FROM sessoes WHERE expira_em <= datetime('now')"));
+    await abrirSessao(res, u.id);
+    await auditar(u.id, 'login', 'usuario', u.id);
     res.json({ usuario: usuarioPublico(u), permissoes: PERMISSOES[u.perfil] });
   });
 
-  app.post('/api/auth/logout', (req, res) => {
-    if (req.cookies.sessao) db.prepare('DELETE FROM sessoes WHERE token = ?').run(req.cookies.sessao);
+  app.post('/api/auth/logout', async (req, res) => {
+    if (req.cookies.sessao) (await db.run('DELETE FROM sessoes WHERE token = ?', req.cookies.sessao));
     res.clearCookie('sessao');
     res.json({ ok: true });
   });
 
-  app.get('/api/auth/me', (req, res) => {
+  app.get('/api/auth/me', async (req, res) => {
     if (!req.usuario) return res.json({ usuario: null });
-    const loja = req.usuario.loja_id ? db.prepare('SELECT id, nome FROM lojas WHERE id = ?').get(req.usuario.loja_id) : null;
+    const loja = req.usuario.loja_id ? (await db.get('SELECT id, nome FROM lojas WHERE id = ?', req.usuario.loja_id)) : null;
     res.json({ usuario: usuarioPublico(req.usuario), loja, permissoes: PERMISSOES[req.usuario.perfil] });
   });
 
   // Autocadastro de clientes
-  app.post('/api/auth/cadastro', (req, res) => {
+  app.post('/api/auth/cadastro', async (req, res) => {
     const dados = validarDadosUsuario(req.body, { novo: true });
-    if (db.prepare('SELECT 1 FROM usuarios WHERE email = ?').get(dados.email)) falha(409, 'Já existe uma conta com este e-mail.');
-    const id = db
-      .prepare('INSERT INTO usuarios (nome, email, senha_hash, telefone, cpf, data_nascimento, perfil) VALUES (?,?,?,?,?,?,?)')
-      .run(dados.nome, dados.email, bcrypt.hashSync(dados.senha, 10), dados.telefone, dados.cpf, dados.data_nascimento, 'cliente')
+    if ((await db.get('SELECT 1 FROM usuarios WHERE email = ?', dados.email))) falha(409, 'Já existe uma conta com este e-mail.');
+    const id = (await db.run('INSERT INTO usuarios (nome, email, senha_hash, telefone, cpf, data_nascimento, perfil) VALUES (?,?,?,?,?,?,?)', dados.nome, dados.email, bcrypt.hashSync(dados.senha, 10), dados.telefone, dados.cpf, dados.data_nascimento, 'cliente'))
       .lastInsertRowid;
-    auditar(id, 'autocadastro', 'usuario', id);
-    abrirSessao(res, id);
-    const u = db.prepare('SELECT * FROM usuarios WHERE id = ?').get(id);
+    await auditar(id, 'autocadastro', 'usuario', id);
+    await abrirSessao(res, id);
+    const u = (await db.get('SELECT * FROM usuarios WHERE id = ?', id));
     res.status(201).json({ usuario: usuarioPublico(u), permissoes: PERMISSOES.cliente });
   });
 
-  app.put('/api/perfil', exigirLogin, (req, res) => {
+  app.put('/api/perfil', exigirLogin, async (req, res) => {
     const u = req.usuario;
     const nome = req.body.nome !== undefined ? String(req.body.nome).trim() : u.nome;
     if (!nome) falha(400, 'Informe o nome.');
@@ -146,17 +135,19 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       if (String(req.body.nova_senha).length < 8) falha(400, 'A nova senha deve ter ao menos 8 caracteres.');
       hash = bcrypt.hashSync(String(req.body.nova_senha), 10);
     }
-    db.prepare('UPDATE usuarios SET nome = ?, telefone = ?, senha_hash = ? WHERE id = ?').run(nome, telefone, hash, u.id);
-    auditar(u.id, 'editar_perfil', 'usuario', u.id);
-    res.json({ usuario: usuarioPublico(db.prepare('SELECT * FROM usuarios WHERE id = ?').get(u.id)) });
+    (await db.run('UPDATE usuarios SET nome = ?, telefone = ?, senha_hash = ? WHERE id = ?', nome, telefone, hash, u.id));
+    await auditar(u.id, 'editar_perfil', 'usuario', u.id);
+    res.json({ usuario: usuarioPublico((await db.get('SELECT * FROM usuarios WHERE id = ?', u.id))) });
   });
 
-  app.get('/api/perfis', (req, res) => res.json({ perfis: PERFIS, permissoes: PERMISSOES }));
+  app.get('/api/saude', async (req, res) => res.json({ ok: true }));
+
+  app.get('/api/perfis', async (req, res) => res.json({ perfis: PERFIS, permissoes: PERMISSOES }));
 
   // ---------- Lojas ----------
-  app.get('/api/lojas', (req, res) => {
+  app.get('/api/lojas', async (req, res) => {
     const todas = tem(req.usuario, 'lojas.gerenciar') && req.query.todas === '1';
-    res.json(db.prepare(`SELECT * FROM lojas ${todas ? '' : 'WHERE ativa = 1'} ORDER BY nome`).all());
+    res.json((await db.all(`SELECT * FROM lojas ${todas ? '' : 'WHERE ativa = 1'} ORDER BY nome`)));
   });
 
   const validarLoja = (b) => {
@@ -171,24 +162,18 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     return [nome, b.endereco || null, b.cidade || null, b.telefone || null, abertura, fechamento, dur, b.ativa === false ? 0 : 1];
   };
 
-  app.post('/api/lojas', exigir('lojas.gerenciar'), (req, res) => {
-    const id = db
-      .prepare(
-        'INSERT INTO lojas (nome, endereco, cidade, telefone, hora_abertura, hora_fechamento, duracao_consulta, ativa) VALUES (?,?,?,?,?,?,?,?)'
-      )
-      .run(...validarLoja(req.body)).lastInsertRowid;
-    auditar(req.usuario.id, 'criar', 'loja', id, req.body);
-    res.status(201).json(db.prepare('SELECT * FROM lojas WHERE id = ?').get(id));
+  app.post('/api/lojas', exigir('lojas.gerenciar'), async (req, res) => {
+    const id = (await db.run('INSERT INTO lojas (nome, endereco, cidade, telefone, hora_abertura, hora_fechamento, duracao_consulta, ativa) VALUES (?,?,?,?,?,?,?,?)', ...validarLoja(req.body))).lastInsertRowid;
+    await auditar(req.usuario.id, 'criar', 'loja', id, req.body);
+    res.status(201).json((await db.get('SELECT * FROM lojas WHERE id = ?', id)));
   });
 
-  app.put('/api/lojas/:id', exigir('lojas.gerenciar'), (req, res) => {
+  app.put('/api/lojas/:id', exigir('lojas.gerenciar'), async (req, res) => {
     const id = Number(req.params.id);
-    if (!db.prepare('SELECT 1 FROM lojas WHERE id = ?').get(id)) falha(404, 'Loja não encontrada.');
-    db.prepare(
-      'UPDATE lojas SET nome=?, endereco=?, cidade=?, telefone=?, hora_abertura=?, hora_fechamento=?, duracao_consulta=?, ativa=? WHERE id=?'
-    ).run(...validarLoja(req.body), id);
-    auditar(req.usuario.id, 'editar', 'loja', id, req.body);
-    res.json(db.prepare('SELECT * FROM lojas WHERE id = ?').get(id));
+    if (!(await db.get('SELECT 1 FROM lojas WHERE id = ?', id))) falha(404, 'Loja não encontrada.');
+    (await db.run('UPDATE lojas SET nome=?, endereco=?, cidade=?, telefone=?, hora_abertura=?, hora_fechamento=?, duracao_consulta=?, ativa=? WHERE id=?', ...validarLoja(req.body), id));
+    await auditar(req.usuario.id, 'editar', 'loja', id, req.body);
+    res.json((await db.get('SELECT * FROM lojas WHERE id = ?', id)));
   });
 
   // ---------- Usuários ----------
@@ -214,14 +199,14 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     return alvo.loja_id === eu.loja_id;
   }
 
-  function resolverLojaDoUsuario(eu, perfil, lojaId) {
+  async function resolverLojaDoUsuario(eu, perfil, lojaId) {
     if (perfil === 'cliente' || perfil === 'admin') return null;
     const id = eu.perfil === 'admin' ? Number(lojaId) : eu.loja_id;
-    if (!id || !db.prepare('SELECT 1 FROM lojas WHERE id = ?').get(id)) falha(400, 'Escolha a loja deste funcionário.');
+    if (!id || !(await db.get('SELECT 1 FROM lojas WHERE id = ?', id))) falha(400, 'Escolha a loja deste funcionário.');
     return id;
   }
 
-  app.get('/api/usuarios', exigir('usuarios.gerenciar', 'clientes.ver'), (req, res) => {
+  app.get('/api/usuarios', exigir('usuarios.gerenciar', 'clientes.ver'), async (req, res) => {
     const eu = req.usuario;
     const filtros = [];
     const params = [];
@@ -243,28 +228,21 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       filtros.push('(nome LIKE ? OR email LIKE ? OR cpf LIKE ? OR telefone LIKE ?)');
       params.push(termo, termo, termo.replace(/\D/g, '') ? `%${String(req.query.busca).replace(/\D/g, '')}%` : termo, termo);
     }
-    const lista = db
-      .prepare(`SELECT * FROM usuarios WHERE ${filtros.join(' AND ')} ORDER BY nome LIMIT 200`)
-      .all(...params)
+    const lista = (await db.all(`SELECT * FROM usuarios WHERE ${filtros.join(' AND ')} ORDER BY nome LIMIT 200`, ...params))
       .map(usuarioPublico);
     res.json(lista);
   });
 
-  app.post('/api/usuarios', exigir('usuarios.gerenciar', 'clientes.cadastrar'), (req, res) => {
+  app.post('/api/usuarios', exigir('usuarios.gerenciar', 'clientes.cadastrar'), async (req, res) => {
     const eu = req.usuario;
     const perfil = req.body.perfil || 'cliente';
     if (!PERFIS[perfil]) falha(400, 'Perfil inválido.');
     if (!PODE_GERENCIAR[eu.perfil].includes(perfil)) falha(403, 'Você não pode cadastrar usuários com este perfil.');
     const dados = validarDadosUsuario(req.body, { novo: true });
-    if (db.prepare('SELECT 1 FROM usuarios WHERE email = ?').get(dados.email)) falha(409, 'Já existe um usuário com este e-mail.');
-    const lojaId = resolverLojaDoUsuario(eu, perfil, req.body.loja_id);
-    const id = db
-      .prepare(
-        `INSERT INTO usuarios (nome, email, senha_hash, telefone, cpf, data_nascimento, perfil, loja_id, registro_profissional)
-         VALUES (?,?,?,?,?,?,?,?,?)`
-      )
-      .run(
-        dados.nome,
+    if ((await db.get('SELECT 1 FROM usuarios WHERE email = ?', dados.email))) falha(409, 'Já existe um usuário com este e-mail.');
+    const lojaId = await resolverLojaDoUsuario(eu, perfil, req.body.loja_id);
+    const id = (await db.run(`INSERT INTO usuarios (nome, email, senha_hash, telefone, cpf, data_nascimento, perfil, loja_id, registro_profissional)
+         VALUES (?,?,?,?,?,?,?,?,?)`, dados.nome,
         dados.email,
         bcrypt.hashSync(dados.senha, 10),
         dados.telefone,
@@ -272,29 +250,25 @@ function criarApp(db, { agora = () => new Date() } = {}) {
         dados.data_nascimento,
         perfil,
         lojaId,
-        perfil === 'optometrista' ? req.body.registro_profissional || null : null
-      ).lastInsertRowid;
-    auditar(eu.id, 'criar', 'usuario', id, { perfil, loja_id: lojaId });
-    res.status(201).json(usuarioPublico(db.prepare('SELECT * FROM usuarios WHERE id = ?').get(id)));
+        perfil === 'optometrista' ? req.body.registro_profissional || null : null)).lastInsertRowid;
+    await auditar(eu.id, 'criar', 'usuario', id, { perfil, loja_id: lojaId });
+    res.status(201).json(usuarioPublico((await db.get('SELECT * FROM usuarios WHERE id = ?', id))));
   });
 
-  app.put('/api/usuarios/:id', exigir('usuarios.gerenciar', 'clientes.cadastrar'), (req, res) => {
+  app.put('/api/usuarios/:id', exigir('usuarios.gerenciar', 'clientes.cadastrar'), async (req, res) => {
     const eu = req.usuario;
-    const alvo = db.prepare('SELECT * FROM usuarios WHERE id = ?').get(Number(req.params.id));
+    const alvo = (await db.get('SELECT * FROM usuarios WHERE id = ?', Number(req.params.id)));
     if (!alvo || !noEscopo(eu, alvo)) falha(404, 'Usuário não encontrado.');
     if (alvo.id === eu.id) falha(400, 'Use "Meu perfil" para alterar seus próprios dados.');
     const perfil = req.body.perfil || alvo.perfil;
     if (!PODE_GERENCIAR[eu.perfil].includes(perfil)) falha(403, 'Você não pode atribuir este perfil.');
     const dados = validarDadosUsuario({ ...alvo, ...req.body }, { novo: false });
-    const outro = db.prepare('SELECT id FROM usuarios WHERE email = ? AND id <> ?').get(dados.email, alvo.id);
+    const outro = (await db.get('SELECT id FROM usuarios WHERE email = ? AND id <> ?', dados.email, alvo.id));
     if (outro) falha(409, 'Já existe um usuário com este e-mail.');
-    const lojaId = resolverLojaDoUsuario(eu, perfil, req.body.loja_id ?? alvo.loja_id);
+    const lojaId = await resolverLojaDoUsuario(eu, perfil, req.body.loja_id ?? alvo.loja_id);
     const ativo = req.body.ativo === undefined ? alvo.ativo : req.body.ativo ? 1 : 0;
-    db.prepare(
-      `UPDATE usuarios SET nome=?, email=?, telefone=?, cpf=?, data_nascimento=?, perfil=?, loja_id=?, registro_profissional=?, ativo=?,
-       senha_hash=? WHERE id=?`
-    ).run(
-      dados.nome,
+    (await db.run(`UPDATE usuarios SET nome=?, email=?, telefone=?, cpf=?, data_nascimento=?, perfil=?, loja_id=?, registro_profissional=?, ativo=?,
+       senha_hash=? WHERE id=?`, dados.nome,
       dados.email,
       dados.telefone,
       dados.cpf,
@@ -304,38 +278,37 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       perfil === 'optometrista' ? req.body.registro_profissional ?? alvo.registro_profissional : null,
       ativo,
       req.body.senha ? bcrypt.hashSync(dados.senha, 10) : alvo.senha_hash,
-      alvo.id
-    );
-    if (!ativo) db.prepare('DELETE FROM sessoes WHERE usuario_id = ?').run(alvo.id);
+      alvo.id));
+    if (!ativo) (await db.run('DELETE FROM sessoes WHERE usuario_id = ?', alvo.id));
     const { senha, ...semSenha } = req.body;
-    auditar(eu.id, 'editar', 'usuario', alvo.id, { ...semSenha, senha_alterada: !!senha });
-    res.json(usuarioPublico(db.prepare('SELECT * FROM usuarios WHERE id = ?').get(alvo.id)));
+    await auditar(eu.id, 'editar', 'usuario', alvo.id, { ...semSenha, senha_alterada: !!senha });
+    res.json(usuarioPublico((await db.get('SELECT * FROM usuarios WHERE id = ?', alvo.id))));
   });
 
   // Optometristas visíveis para agendamento (nome apenas)
-  app.get('/api/optometristas', exigirLogin, (req, res) => {
+  app.get('/api/optometristas', exigirLogin, async (req, res) => {
     const lojaId = req.query.loja_id ? Number(req.query.loja_id) : null;
     const sql = lojaId
       ? `SELECT DISTINCT u.id, u.nome, u.loja_id FROM usuarios u JOIN disponibilidades d ON d.optometrista_id = u.id
          WHERE u.perfil='optometrista' AND u.ativo=1 AND (d.loja_id = ? OR u.loja_id = ?) ORDER BY u.nome`
       : `SELECT id, nome, loja_id FROM usuarios WHERE perfil='optometrista' AND ativo=1 ORDER BY nome`;
-    res.json(lojaId ? db.prepare(sql).all(lojaId, lojaId) : db.prepare(sql).all());
+    res.json(lojaId ? (await db.all(sql, lojaId, lojaId)) : (await db.all(sql)));
   });
 
   // ---------- Disponibilidade e bloqueios ----------
-  const optometristaNoEscopo = (eu, optId) => {
-    const o = db.prepare("SELECT * FROM usuarios WHERE id = ? AND perfil = 'optometrista'").get(optId);
+  const optometristaNoEscopo = async (eu, optId) => {
+    const o = (await db.get("SELECT * FROM usuarios WHERE id = ? AND perfil = 'optometrista'", optId));
     if (!o) return null;
     if (eu.perfil === 'admin') return o;
     if (eu.perfil === 'optometrista') return o.id === eu.id ? o : null;
     if (eu.perfil === 'gerente') {
-      const atendeNaLoja = db.prepare('SELECT 1 FROM disponibilidades WHERE optometrista_id = ? AND loja_id = ?').get(o.id, eu.loja_id);
+      const atendeNaLoja = (await db.get('SELECT 1 FROM disponibilidades WHERE optometrista_id = ? AND loja_id = ?', o.id, eu.loja_id));
       return o.loja_id === eu.loja_id || atendeNaLoja ? o : null;
     }
     return null;
   };
 
-  app.get('/api/disponibilidades', exigir('agenda.configurar', 'agenda.bloquear_propria'), (req, res) => {
+  app.get('/api/disponibilidades', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
     const eu = req.usuario;
     const f = [];
     const p = [];
@@ -355,94 +328,77 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       p.push(Number(req.query.optometrista_id));
     }
     res.json(
-      db
-        .prepare(
-          `SELECT d.*, u.nome AS optometrista_nome, l.nome AS loja_nome FROM disponibilidades d
+      (await db.all(`SELECT d.*, u.nome AS optometrista_nome, l.nome AS loja_nome FROM disponibilidades d
            JOIN usuarios u ON u.id = d.optometrista_id JOIN lojas l ON l.id = d.loja_id
-           ${f.length ? 'WHERE ' + f.join(' AND ') : ''} ORDER BY u.nome, d.dia_semana, d.hora_inicio`
-        )
-        .all(...p)
+           ${f.length ? 'WHERE ' + f.join(' AND ') : ''} ORDER BY u.nome, d.dia_semana, d.hora_inicio`, ...p))
     );
   });
 
-  app.post('/api/disponibilidades', exigir('agenda.configurar'), (req, res) => {
+  app.post('/api/disponibilidades', exigir('agenda.configurar'), async (req, res) => {
     const eu = req.usuario;
     const { optometrista_id, dia_semana, hora_inicio, hora_fim } = req.body;
     const lojaId = eu.perfil === 'admin' ? Number(req.body.loja_id) : eu.loja_id;
-    if (!db.prepare('SELECT 1 FROM lojas WHERE id = ?').get(lojaId)) falha(400, 'Loja inválida.');
-    const o = db.prepare("SELECT * FROM usuarios WHERE id = ? AND perfil = 'optometrista' AND ativo = 1").get(Number(optometrista_id));
+    if (!(await db.get('SELECT 1 FROM lojas WHERE id = ?', lojaId))) falha(400, 'Loja inválida.');
+    const o = (await db.get("SELECT * FROM usuarios WHERE id = ? AND perfil = 'optometrista' AND ativo = 1", Number(optometrista_id)));
     if (!o) falha(400, 'Optometrista inválido.');
     const dia = Number(dia_semana);
     if (!Number.isInteger(dia) || dia < 0 || dia > 6) falha(400, 'Dia da semana inválido.');
     if (!agenda.horaValida(hora_inicio) || !agenda.horaValida(hora_fim) || hora_inicio >= hora_fim) falha(400, 'Horário inválido.');
-    const conflito = db
-      .prepare('SELECT 1 FROM disponibilidades WHERE optometrista_id = ? AND dia_semana = ? AND hora_inicio < ? AND ? < hora_fim')
-      .get(o.id, dia, hora_fim, hora_inicio);
+    const conflito = (await db.get('SELECT 1 FROM disponibilidades WHERE optometrista_id = ? AND dia_semana = ? AND hora_inicio < ? AND ? < hora_fim', o.id, dia, hora_fim, hora_inicio));
     if (conflito) falha(409, 'Este optometrista já tem horário cadastrado nesse intervalo.');
-    const id = db
-      .prepare('INSERT INTO disponibilidades (optometrista_id, loja_id, dia_semana, hora_inicio, hora_fim) VALUES (?,?,?,?,?)')
-      .run(o.id, lojaId, dia, hora_inicio, hora_fim).lastInsertRowid;
-    auditar(eu.id, 'criar', 'disponibilidade', id, req.body);
-    res.status(201).json(db.prepare('SELECT * FROM disponibilidades WHERE id = ?').get(id));
+    const id = (await db.run('INSERT INTO disponibilidades (optometrista_id, loja_id, dia_semana, hora_inicio, hora_fim) VALUES (?,?,?,?,?)', o.id, lojaId, dia, hora_inicio, hora_fim)).lastInsertRowid;
+    await auditar(eu.id, 'criar', 'disponibilidade', id, req.body);
+    res.status(201).json((await db.get('SELECT * FROM disponibilidades WHERE id = ?', id)));
   });
 
-  app.delete('/api/disponibilidades/:id', exigir('agenda.configurar'), (req, res) => {
-    const d = db.prepare('SELECT * FROM disponibilidades WHERE id = ?').get(Number(req.params.id));
+  app.delete('/api/disponibilidades/:id', exigir('agenda.configurar'), async (req, res) => {
+    const d = (await db.get('SELECT * FROM disponibilidades WHERE id = ?', Number(req.params.id)));
     if (!d || (req.usuario.perfil !== 'admin' && d.loja_id !== req.usuario.loja_id)) falha(404, 'Horário não encontrado.');
-    db.prepare('DELETE FROM disponibilidades WHERE id = ?').run(d.id);
-    auditar(req.usuario.id, 'excluir', 'disponibilidade', d.id, d);
+    (await db.run('DELETE FROM disponibilidades WHERE id = ?', d.id));
+    await auditar(req.usuario.id, 'excluir', 'disponibilidade', d.id, d);
     res.json({ ok: true });
   });
 
-  app.get('/api/bloqueios', exigir('agenda.configurar', 'agenda.bloquear_propria'), (req, res) => {
+  app.get('/api/bloqueios', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
     const eu = req.usuario;
-    let lista = db
-      .prepare(
-        `SELECT b.*, u.nome AS optometrista_nome FROM bloqueios b JOIN usuarios u ON u.id = b.optometrista_id
-         WHERE b.data >= ? ORDER BY b.data, b.hora_inicio`
-      )
-      .all(agenda.hojeISO(agora()));
-    lista = lista.filter((b) => optometristaNoEscopo(eu, b.optometrista_id));
+    let lista = (await db.all(`SELECT b.*, u.nome AS optometrista_nome FROM bloqueios b JOIN usuarios u ON u.id = b.optometrista_id
+         WHERE b.data >= ? ORDER BY b.data, b.hora_inicio`, agenda.hojeISO(agora())));
+    const visiveis = await Promise.all(lista.map((b) => optometristaNoEscopo(eu, b.optometrista_id)));
+    lista = lista.filter((_, i) => visiveis[i]);
     res.json(lista);
   });
 
-  app.post('/api/bloqueios', exigir('agenda.configurar', 'agenda.bloquear_propria'), (req, res) => {
+  app.post('/api/bloqueios', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
     const eu = req.usuario;
     const optId = eu.perfil === 'optometrista' ? eu.id : Number(req.body.optometrista_id);
-    if (!optometristaNoEscopo(eu, optId)) falha(400, 'Optometrista inválido.');
+    if (!await optometristaNoEscopo(eu, optId)) falha(400, 'Optometrista inválido.');
     const { data } = req.body;
     const hi = req.body.hora_inicio || '00:00';
     const hf = req.body.hora_fim || '23:59';
     if (!agenda.dataValida(data)) falha(400, 'Data inválida.');
     if (!agenda.horaValida(hi) || !agenda.horaValida(hf) || hi >= hf) falha(400, 'Horário inválido.');
-    const id = db
-      .prepare('INSERT INTO bloqueios (optometrista_id, data, hora_inicio, hora_fim, motivo) VALUES (?,?,?,?,?)')
-      .run(optId, data, hi, hf, req.body.motivo || null).lastInsertRowid;
-    auditar(eu.id, 'criar', 'bloqueio', id, req.body);
+    const id = (await db.run('INSERT INTO bloqueios (optometrista_id, data, hora_inicio, hora_fim, motivo) VALUES (?,?,?,?,?)', optId, data, hi, hf, req.body.motivo || null)).lastInsertRowid;
+    await auditar(eu.id, 'criar', 'bloqueio', id, req.body);
     // Avisa quais consultas já marcadas caem no bloqueio, para a loja remarcar
-    const afetados = db
-      .prepare(
-        `SELECT a.id, a.hora, c.nome AS cliente_nome FROM agendamentos a JOIN usuarios c ON c.id = a.cliente_id
-         WHERE a.optometrista_id = ? AND a.data = ? AND a.status IN ('agendado','confirmado') AND a.hora < ? AND a.hora >= ?`
-      )
-      .all(optId, data, hf, hi);
+    const afetados = (await db.all(`SELECT a.id, a.hora, c.nome AS cliente_nome FROM agendamentos a JOIN usuarios c ON c.id = a.cliente_id
+         WHERE a.optometrista_id = ? AND a.data = ? AND a.status IN ('agendado','confirmado') AND a.hora < ? AND a.hora >= ?`, optId, data, hf, hi));
     res.status(201).json({ id, agendamentos_afetados: afetados });
   });
 
-  app.delete('/api/bloqueios/:id', exigir('agenda.configurar', 'agenda.bloquear_propria'), (req, res) => {
-    const b = db.prepare('SELECT * FROM bloqueios WHERE id = ?').get(Number(req.params.id));
-    if (!b || !optometristaNoEscopo(req.usuario, b.optometrista_id)) falha(404, 'Bloqueio não encontrado.');
-    db.prepare('DELETE FROM bloqueios WHERE id = ?').run(b.id);
-    auditar(req.usuario.id, 'excluir', 'bloqueio', b.id, b);
+  app.delete('/api/bloqueios/:id', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
+    const b = (await db.get('SELECT * FROM bloqueios WHERE id = ?', Number(req.params.id)));
+    if (!b || !await optometristaNoEscopo(req.usuario, b.optometrista_id)) falha(404, 'Bloqueio não encontrado.');
+    (await db.run('DELETE FROM bloqueios WHERE id = ?', b.id));
+    await auditar(req.usuario.id, 'excluir', 'bloqueio', b.id, b);
     res.json({ ok: true });
   });
 
   // ---------- Horários livres ----------
-  app.get('/api/horarios', exigirLogin, (req, res) => {
+  app.get('/api/horarios', exigirLogin, async (req, res) => {
     const { loja_id, data, optometrista_id } = req.query;
     if (!agenda.dataValida(data)) falha(400, 'Data inválida.');
     res.json(
-      agenda.horariosLivres(db, {
+      await agenda.horariosLivres(db, {
         lojaId: Number(loja_id),
         data,
         optometristaId: optometrista_id ? Number(optometrista_id) : null,
@@ -471,14 +427,14 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     }
   }
 
-  function buscarAgendamento(eu, id) {
+  async function buscarAgendamento(eu, id) {
     const [cond, p] = escopoAgendamentos(eu);
-    const ag = db.prepare(`${SELECT_AG} WHERE a.id = ? AND ${cond}`).get(Number(id), ...p);
+    const ag = (await db.get(`${SELECT_AG} WHERE a.id = ? AND ${cond}`, Number(id), ...p));
     if (!ag) falha(404, 'Agendamento não encontrado.');
     return ag;
   }
 
-  app.get('/api/agendamentos', exigirLogin, (req, res) => {
+  app.get('/api/agendamentos', exigirLogin, async (req, res) => {
     const eu = req.usuario;
     const [cond, p] = escopoAgendamentos(eu);
     const f = [cond];
@@ -495,12 +451,12 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       params.push(...sts);
     }
     const ordem = q.ordem === 'desc' ? 'DESC' : 'ASC';
-    res.json(db.prepare(`${SELECT_AG} WHERE ${f.join(' AND ')} ORDER BY a.data ${ordem}, a.hora ${ordem} LIMIT 500`).all(...params));
+    res.json((await db.all(`${SELECT_AG} WHERE ${f.join(' AND ')} ORDER BY a.data ${ordem}, a.hora ${ordem} LIMIT 500`, ...params)));
   });
 
-  app.get('/api/agendamentos/:id', exigirLogin, (req, res) => res.json(buscarAgendamento(req.usuario, req.params.id)));
+  app.get('/api/agendamentos/:id', exigirLogin, async (req, res) => res.json(await buscarAgendamento(req.usuario, req.params.id)));
 
-  app.post('/api/agendamentos', exigir('agendamentos.criar', 'agendamentos.proprios'), (req, res) => {
+  app.post('/api/agendamentos', exigir('agendamentos.criar', 'agendamentos.proprios'), async (req, res) => {
     const eu = req.usuario;
     const lojaId = Number(req.body.loja_id);
     const { data, hora } = req.body;
@@ -509,33 +465,27 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       if (lojaId !== eu.loja_id) falha(403, 'Você só pode agendar na sua loja.');
     }
     const clienteId = eu.perfil === 'cliente' ? eu.id : Number(req.body.cliente_id);
-    const cliente = db.prepare("SELECT * FROM usuarios WHERE id = ? AND perfil = 'cliente' AND ativo = 1").get(clienteId);
+    const cliente = (await db.get("SELECT * FROM usuarios WHERE id = ? AND perfil = 'cliente' AND ativo = 1", clienteId));
     if (!cliente) falha(400, 'Selecione o cliente.');
 
-    const id = transacao(db, () => {
-      const jaTem = db
-        .prepare("SELECT 1 FROM agendamentos WHERE cliente_id = ? AND data = ? AND status IN ('agendado','confirmado','em_atendimento')")
-        .get(clienteId, data);
+    const id = await db.transacao(async (db) => {
+      const jaTem = (await db.get("SELECT 1 FROM agendamentos WHERE cliente_id = ? AND data = ? AND status IN ('agendado','confirmado','em_atendimento')", clienteId, data));
       if (jaTem) falha(409, 'Este cliente já tem um exame marcado nesta data.');
-      const slot = agenda
-        .horariosLivres(db, {
+      const slot = (
+        await agenda.horariosLivres(db, {
           lojaId,
           data,
           optometristaId: req.body.optometrista_id ? Number(req.body.optometrista_id) : null,
           agora: agora(),
         })
-        .find((s) => s.hora === hora);
+      ).find((s) => s.hora === hora);
       if (!slot) falha(409, 'Este horário não está mais disponível. Escolha outro.');
-      const loja = db.prepare('SELECT duracao_consulta FROM lojas WHERE id = ?').get(lojaId);
-      return db
-        .prepare(
-          'INSERT INTO agendamentos (loja_id, cliente_id, optometrista_id, data, hora, duracao, observacoes, criado_por) VALUES (?,?,?,?,?,?,?,?)'
-        )
-        .run(lojaId, clienteId, slot.optometristas[0].id, data, hora, loja.duracao_consulta, req.body.observacoes || null, eu.id)
+      const loja = (await db.get('SELECT duracao_consulta FROM lojas WHERE id = ?', lojaId));
+      return (await db.run('INSERT INTO agendamentos (loja_id, cliente_id, optometrista_id, data, hora, duracao, observacoes, criado_por) VALUES (?,?,?,?,?,?,?,?)', lojaId, clienteId, slot.optometristas[0].id, data, hora, loja.duracao_consulta, req.body.observacoes || null, eu.id))
         .lastInsertRowid;
     });
-    auditar(eu.id, 'criar', 'agendamento', id, { loja_id: lojaId, data, hora, cliente_id: clienteId });
-    res.status(201).json(buscarAgendamento(eu, id));
+    await auditar(eu.id, 'criar', 'agendamento', id, { loja_id: lojaId, data, hora, cliente_id: clienteId });
+    res.status(201).json(await buscarAgendamento(eu, id));
   });
 
   const minutosAte = (ag) => {
@@ -553,9 +503,9 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     faltou: { de: ['agendado', 'confirmado'], perfis: ['admin', 'gerente', 'atendente', 'optometrista'] },
   };
 
-  app.patch('/api/agendamentos/:id/status', exigirLogin, (req, res) => {
+  app.patch('/api/agendamentos/:id/status', exigirLogin, async (req, res) => {
     const eu = req.usuario;
-    const ag = buscarAgendamento(eu, req.params.id);
+    const ag = await buscarAgendamento(eu, req.params.id);
     const novo = req.body.status;
     const regra = TRANSICOES[novo];
     if (!regra) falha(400, 'Status inválido.');
@@ -566,41 +516,37 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       falha(409, 'Cancelamentos pelo site precisam de 2 horas de antecedência. Ligue para a loja.');
     if (novo === 'faltou' && faltam > 0) falha(409, 'Só é possível marcar falta depois do horário da consulta.');
     if (novo === 'em_atendimento' && ag.data !== agenda.hojeISO(agora())) falha(409, 'O atendimento só pode ser iniciado no dia da consulta.');
-    db.prepare("UPDATE agendamentos SET status = ?, motivo_cancelamento = ?, atualizado_em = datetime('now') WHERE id = ?").run(
-      novo,
+    (await db.run("UPDATE agendamentos SET status = ?, motivo_cancelamento = ?, atualizado_em = datetime('now') WHERE id = ?", novo,
       novo === 'cancelado' ? req.body.motivo || null : ag.motivo_cancelamento,
-      ag.id
-    );
-    auditar(eu.id, 'status', 'agendamento', ag.id, { de: ag.status, para: novo, motivo: req.body.motivo });
-    res.json(buscarAgendamento(eu, ag.id));
+      ag.id));
+    await auditar(eu.id, 'status', 'agendamento', ag.id, { de: ag.status, para: novo, motivo: req.body.motivo });
+    res.json(await buscarAgendamento(eu, ag.id));
   });
 
-  app.put('/api/agendamentos/:id/remarcar', exigir('agendamentos.alterar', 'agendamentos.proprios'), (req, res) => {
+  app.put('/api/agendamentos/:id/remarcar', exigir('agendamentos.alterar', 'agendamentos.proprios'), async (req, res) => {
     const eu = req.usuario;
-    const ag = buscarAgendamento(eu, req.params.id);
+    const ag = await buscarAgendamento(eu, req.params.id);
     if (!['agendado', 'confirmado'].includes(ag.status)) falha(409, 'Só consultas agendadas ou confirmadas podem ser remarcadas.');
     if (eu.perfil === 'cliente' && minutosAte(ag) < ANTECEDENCIA_CANCELAMENTO_CLIENTE_MIN)
       falha(409, 'Remarcações pelo site precisam de 2 horas de antecedência. Ligue para a loja.');
     const { data, hora } = req.body;
     if (!agenda.dataValida(data) || !agenda.horaValida(hora)) falha(400, 'Escolha data e horário.');
-    transacao(db, () => {
-      const slot = agenda
-        .horariosLivres(db, {
+    await db.transacao(async (db) => {
+      const slot = (
+        await agenda.horariosLivres(db, {
           lojaId: ag.loja_id,
           data,
           optometristaId: req.body.optometrista_id ? Number(req.body.optometrista_id) : null,
           ignorarAgendamentoId: ag.id,
           agora: agora(),
         })
-        .find((s) => s.hora === hora);
+      ).find((s) => s.hora === hora);
       if (!slot) falha(409, 'Este horário não está disponível. Escolha outro.');
       const opt = slot.optometristas.find((o) => o.id === ag.optometrista_id) || slot.optometristas[0];
-      db.prepare(
-        "UPDATE agendamentos SET data = ?, hora = ?, optometrista_id = ?, status = 'agendado', atualizado_em = datetime('now') WHERE id = ?"
-      ).run(data, hora, opt.id, ag.id);
+      (await db.run("UPDATE agendamentos SET data = ?, hora = ?, optometrista_id = ?, status = 'agendado', atualizado_em = datetime('now') WHERE id = ?", data, hora, opt.id, ag.id));
     });
-    auditar(eu.id, 'remarcar', 'agendamento', ag.id, { de: `${ag.data} ${ag.hora}`, para: `${data} ${hora}` });
-    res.json(buscarAgendamento(eu, ag.id));
+    await auditar(eu.id, 'remarcar', 'agendamento', ag.id, { de: `${ag.data} ${ag.hora}`, para: `${data} ${hora}` });
+    res.json(await buscarAgendamento(eu, ag.id));
   });
 
   // ---------- Exames (dados clínicos) ----------
@@ -611,43 +557,37 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     'adicao', 'dnp', 'observacoes',
   ];
 
-  app.get('/api/agendamentos/:id/exame', exigir('exames.ver', 'exames.proprios'), (req, res) => {
-    const ag = buscarAgendamento(req.usuario, req.params.id);
-    res.json(db.prepare('SELECT * FROM exames WHERE agendamento_id = ?').get(ag.id) || null);
+  app.get('/api/agendamentos/:id/exame', exigir('exames.ver', 'exames.proprios'), async (req, res) => {
+    const ag = await buscarAgendamento(req.usuario, req.params.id);
+    res.json((await db.get('SELECT * FROM exames WHERE agendamento_id = ?', ag.id)) || null);
   });
 
-  app.put('/api/agendamentos/:id/exame', exigir('exames.registrar'), (req, res) => {
-    const ag = buscarAgendamento(req.usuario, req.params.id);
+  app.put('/api/agendamentos/:id/exame', exigir('exames.registrar'), async (req, res) => {
+    const ag = await buscarAgendamento(req.usuario, req.params.id);
     if (!['em_atendimento', 'concluido'].includes(ag.status)) falha(409, 'Inicie o atendimento antes de registrar o exame.');
     const valores = CAMPOS_EXAME.map((c) => (req.body[c] === undefined || req.body[c] === '' ? null : String(req.body[c]).slice(0, 500)));
-    db.prepare(
-      `INSERT INTO exames (agendamento_id, ${CAMPOS_EXAME.join(', ')}) VALUES (?, ${CAMPOS_EXAME.map(() => '?').join(', ')})
-       ON CONFLICT(agendamento_id) DO UPDATE SET ${CAMPOS_EXAME.map((c) => `${c} = excluded.${c}`).join(', ')}, registrado_em = datetime('now')`
-    ).run(ag.id, ...valores);
-    auditar(req.usuario.id, 'registrar_exame', 'agendamento', ag.id);
-    res.json(db.prepare('SELECT * FROM exames WHERE agendamento_id = ?').get(ag.id));
+    (await db.run(`INSERT INTO exames (agendamento_id, ${CAMPOS_EXAME.join(', ')}) VALUES (?, ${CAMPOS_EXAME.map(() => '?').join(', ')})
+       ON CONFLICT(agendamento_id) DO UPDATE SET ${CAMPOS_EXAME.map((c) => `${c} = excluded.${c}`).join(', ')}, registrado_em = datetime('now')`, ag.id, ...valores));
+    await auditar(req.usuario.id, 'registrar_exame', 'agendamento', ag.id);
+    res.json((await db.get('SELECT * FROM exames WHERE agendamento_id = ?', ag.id)));
   });
 
-  app.get('/api/clientes/:id/exames', exigir('exames.ver', 'exames.proprios'), (req, res) => {
+  app.get('/api/clientes/:id/exames', exigir('exames.ver', 'exames.proprios'), async (req, res) => {
     const eu = req.usuario;
     const clienteId = Number(req.params.id);
     if (eu.perfil === 'cliente' && clienteId !== eu.id) falha(404, 'Cliente não encontrado.');
-    if (eu.perfil === 'optometrista' && !db.prepare('SELECT 1 FROM agendamentos WHERE cliente_id = ? AND optometrista_id = ?').get(clienteId, eu.id))
+    if (eu.perfil === 'optometrista' && !(await db.get('SELECT 1 FROM agendamentos WHERE cliente_id = ? AND optometrista_id = ?', clienteId, eu.id)))
       falha(404, 'Cliente não encontrado.');
     res.json(
-      db
-        .prepare(
-          `SELECT e.*, a.data, a.hora, l.nome AS loja_nome, o.nome AS optometrista_nome, o.registro_profissional
+      (await db.all(`SELECT e.*, a.data, a.hora, l.nome AS loja_nome, o.nome AS optometrista_nome, o.registro_profissional
            FROM exames e JOIN agendamentos a ON a.id = e.agendamento_id JOIN lojas l ON l.id = a.loja_id
            JOIN usuarios o ON o.id = a.optometrista_id
-           WHERE a.cliente_id = ? ORDER BY a.data DESC, a.hora DESC`
-        )
-        .all(clienteId)
+           WHERE a.cliente_id = ? ORDER BY a.data DESC, a.hora DESC`, clienteId))
     );
   });
 
   // ---------- Relatórios ----------
-  app.get('/api/relatorios/resumo', exigir('relatorios.ver'), (req, res) => {
+  app.get('/api/relatorios/resumo', exigir('relatorios.ver'), async (req, res) => {
     const eu = req.usuario;
     const hoje = agenda.hojeISO(agora());
     const inicio = agenda.dataValida(req.query.inicio) ? req.query.inicio : agenda.somarDias(hoje, -30);
@@ -656,9 +596,9 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     const filtro = `a.data BETWEEN ? AND ? ${lojaId ? 'AND a.loja_id = ?' : ''}`;
     const p = lojaId ? [inicio, fim, lojaId] : [inicio, fim];
     const porStatus = Object.fromEntries(
-      db.prepare(`SELECT status, COUNT(*) n FROM agendamentos a WHERE ${filtro} GROUP BY status`).all(...p).map((r) => [r.status, r.n])
+      (await db.all(`SELECT status, COUNT(*) n FROM agendamentos a WHERE ${filtro} GROUP BY status`, ...p)).map((r) => [r.status, r.n])
     );
-    const resumo = (sql) => db.prepare(sql).all(...p);
+    const resumo = (sql) => db.all(sql, ...p);
     const contagens = `COUNT(*) total,
         SUM(a.status = 'concluido') concluidos, SUM(a.status = 'faltou') faltas, SUM(a.status = 'cancelado') cancelados`;
     res.json({
@@ -666,20 +606,16 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       fim,
       loja_id: lojaId,
       por_status: porStatus,
-      por_loja: resumo(`SELECT l.id, l.nome, ${contagens} FROM agendamentos a JOIN lojas l ON l.id = a.loja_id WHERE ${filtro} GROUP BY l.id ORDER BY total DESC`),
-      por_optometrista: resumo(
+      por_loja: await resumo(`SELECT l.id, l.nome, ${contagens} FROM agendamentos a JOIN lojas l ON l.id = a.loja_id WHERE ${filtro} GROUP BY l.id ORDER BY total DESC`),
+      por_optometrista: await resumo(
         `SELECT o.id, o.nome, ${contagens} FROM agendamentos a JOIN usuarios o ON o.id = a.optometrista_id WHERE ${filtro} GROUP BY o.id ORDER BY total DESC`
       ),
     });
   });
 
-  app.get('/api/auditoria', exigir('auditoria.ver'), (req, res) => {
+  app.get('/api/auditoria', exigir('auditoria.ver'), async (req, res) => {
     res.json(
-      db
-        .prepare(
-          `SELECT x.*, u.nome AS usuario_nome FROM auditoria x LEFT JOIN usuarios u ON u.id = x.usuario_id ORDER BY x.id DESC LIMIT 300`
-        )
-        .all()
+      (await db.all(`SELECT x.*, u.nome AS usuario_nome FROM auditoria x LEFT JOIN usuarios u ON u.id = x.usuario_id ORDER BY x.id DESC LIMIT 300`))
     );
   });
 

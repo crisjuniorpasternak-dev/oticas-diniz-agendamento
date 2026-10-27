@@ -6,12 +6,13 @@ const { criarApp } = require('../src/app');
 
 // Relógio fixo: segunda-feira, 02/11/2026, 09:00
 let relogio = new Date(2026, 10, 2, 9, 0);
-const db = abrir(':memory:');
-popularDemo(db);
+let db;
 let base;
 let servidor;
 
 test.before(async () => {
+  db = await abrir(':memory:');
+  await popularDemo(db);
   servidor = criarApp(db, { agora: () => relogio }).listen(0);
   await new Promise((r) => servidor.once('listening', r));
   base = `http://127.0.0.1:${servidor.address().port}`;

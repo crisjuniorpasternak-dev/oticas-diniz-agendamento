@@ -4,7 +4,7 @@ Sistema web para marcar, acompanhar e registrar exames de vista nas lojas da red
 
 ## Como rodar
 
-Requer Node.js 22.13 ou mais novo (usa o SQLite embutido no Node, sem banco externo).
+Requer Node.js 20 ou mais novo. Localmente o banco é um arquivo SQLite; em produção, um banco Turso (SQLite na nuvem).
 
 ```bash
 npm install
@@ -23,8 +23,24 @@ Senha de todos: `diniz123`.
 | Optometrista | ana@diniz.com |
 | Cliente | cliente@exemplo.com |
 
-Variáveis de ambiente: `PORT`, `DB_FILE` (caminho do banco), `SEM_DEMO=1` (não cria dados de demonstração),
-`TZ` (padrão `America/Sao_Paulo`), `NODE_ENV=production` (cookie de sessão só por HTTPS).
+Variáveis de ambiente:
+
+| Variável | Para quê |
+|---|---|
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | Banco Turso (produção). Sem elas, usa o arquivo local `DB_FILE`. |
+| `ADMIN_EMAIL`, `ADMIN_SENHA` | Cria o administrador inicial e **não** cria os dados de demonstração. |
+| `SEM_DEMO=1` | Não cria dados de demonstração. |
+| `NODE_ENV=production` | Cookie de sessão só por HTTPS. |
+| `PORT`, `DB_FILE`, `TZ` | Porta, arquivo do banco local e fuso (padrão `America/Sao_Paulo`). |
+
+## Publicar na Vercel
+
+1. Na Vercel, **Add New → Project** e importe este repositório do GitHub (framework: *Other*, sem comando de build).
+2. Em **Storage** (ou Marketplace), adicione o **Turso** e conecte ao projeto. Ele cria `TURSO_DATABASE_URL` e `TURSO_AUTH_TOKEN`.
+3. Em **Settings → Environment Variables**, adicione `ADMIN_EMAIL`, `ADMIN_SENHA` (mín. 8 caracteres) e `NODE_ENV=production`.
+4. Faça o deploy. O banco é criado no primeiro acesso; entre com o e-mail do administrador e cadastre lojas, equipe e horários.
+
+A interface fica em `public/` (arquivos estáticos) e a API em `api/index.js` (função da Vercel), conforme `vercel.json`.
 
 ## Hierarquia de acessos
 
@@ -58,7 +74,8 @@ seguindo o princípio de necessidade da LGPD. Toda ação relevante é registrad
 ## Estrutura
 
 ```
-src/server.js      inicialização
+api/index.js       entrada na Vercel
+src/server.js      inicialização local
 src/app.js         rotas da API e regras de acesso
 src/permissoes.js  perfis e permissões
 src/agenda.js      cálculo de horários livres
@@ -71,4 +88,3 @@ test/              testes automatizados (node --test)
 
 - Lembretes e confirmação por WhatsApp/SMS (ex.: API oficial do WhatsApp Business) um dia antes do exame.
 - Recuperação de senha por e-mail.
-- Hospedagem (ex.: Railway, Render ou VPS) com HTTPS e backup diário do arquivo do banco.
