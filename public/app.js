@@ -191,6 +191,20 @@ async function iniciar() {
   renderizar();
 }
 
+// Faixa de destaque com a unidade que está sendo visualizada
+function faixaUnidade() {
+  const id = unidadeAtual();
+  const loja = estado.lojas.find((l) => l.id === Number(id)) || estado.loja;
+  const todas = !id;
+  return `<div class="faixa-unidade ${todas ? 'todas' : ''}">
+    <span class="faixa-icone">${icone(todas ? 'inicio' : 'unidades')}</span>
+    <div class="faixa-texto"><span class="kpi-rotulo">${todas ? 'Visualizando' : 'Unidade em visualização'}</span>
+      <b>${esc(todas ? rotuloTodas() : loja?.nome || '')}</b>
+      <small>${todas ? `${estado.lojas.length} unidade(s) · a coluna Unidade mostra de onde é cada agendamento` : esc([loja?.cidade, loja?.endereco].filter(Boolean).join(' · '))}</small></div>
+    ${variasUnidades() ? `<a class="btn sec peq" href="#/unidades">${icone('unidades')} Trocar unidade</a>` : ''}
+  </div>`;
+}
+
 function renderizar() {
   const [rota, sub] = rotaAtual();
   const u = estado.usuario;
@@ -235,7 +249,7 @@ function renderizar() {
           <span class="pilula data-hoje">${icone('agendamentos')} ${diaSemana(hoje())}, ${dataBR(hoje())}</span>
           <a href="#/perfil" class="usuario" title="Meu perfil"><span class="nome"><b>${esc(u.nome)}</b><small>${esc(u.perfil_rotulo)}</small></span><span class="avatar">${esc(iniciais(u.nome))}</span></a>
         </header>
-        <main id="tela"><div class="tela-carregando"><div class="esqueleto"></div><div class="esqueleto"></div><div class="esqueleto"></div></div></main>
+        <main>${['unidades', 'perfil'].includes(rota) ? '' : faixaUnidade()}<section id="tela"><div class="tela-carregando"><div class="esqueleto"></div><div class="esqueleto"></div><div class="esqueleto"></div></div></section></main>
       </div>
       <nav class="inferior" aria-label="Menu">${menu()
         .map(([id, , curto]) =>
@@ -362,7 +376,7 @@ TELAS.inicio = async (el) => {
   const tituloUnidade = unidadeAtual() ? nomeLoja(unidadeAtual()) : rotuloTodas();
   const inicio30 = somarDias(hoje(), -29);
   el.innerHTML = `
-    <div class="cabeca"><div><h1>${esc(tituloUnidade)}</h1><p class="suave">Hoje é ${diaSemana(hoje()).toLowerCase()}, ${dataBR(hoje())}</p></div>
+    <div class="cabeca"><div><h1>Visão geral</h1><p class="suave">Hoje é ${diaSemana(hoje()).toLowerCase()}, ${dataBR(hoje())}</p></div>
       <div class="acoes"><span class="pilula">${icone('agendamentos')} Últimos 30 dias <span class="suave">${dataBR(inicio30).slice(0, 5)} – ${dataBR(hoje()).slice(0, 5)}</span></span>
       ${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo agendamento</a>` : ''}</div></div>
     <div class="kpis" id="kpis">${'<div class="kpi carregando"><div><span class="kpi-rotulo">carregando</span><b>00</b><small>carregando</small></div></div>'.repeat(4)}</div>
@@ -523,7 +537,13 @@ function tabelaAgendamentos(lista, { rapido = false, comData = false } = {}) {
                 ['agendado', 'confirmado'].includes(a.status) && a.data <= hoje()
                   ? `<button class="btn ok peq" data-rapido="compareceu" data-ag="${a.id}">${icone('ok')} Compareceu</button>
                      ${jaPassou(a) ? `<button class="btn alerta peq" data-rapido="faltou" data-ag="${a.id}">Faltou</button>` : ''}`
-                  : ''
+                  : a.status === 'faltou'
+                    ? `<button class="btn sec peq discreto" data-rapido="compareceu" data-ag="${a.id}" title="Corrigir: o cliente veio">Mudar para compareceu</button>`
+                    : a.status === 'compareceu' && jaPassou(a)
+                      ? `<button class="btn sec peq discreto" data-rapido="faltou" data-ag="${a.id}" title="Corrigir: o cliente não veio">Mudar para faltou</button>`
+                      : a.status === 'agendado' || a.status === 'confirmado'
+                        ? '<span class="suave" style="font-size:.8rem">no dia do exame</span>'
+                        : ''
               }</td>`
             : ''
         }</tr>`

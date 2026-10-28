@@ -323,6 +323,9 @@ input[aria-invalid=true] { border-color: var(--cor-erro); }
 .btn.ok:hover { --btn-fundo: var(--cor-sucesso-escuro); --btn-borda: var(--cor-sucesso-escuro); }
 .btn.alerta { --btn-fundo: var(--superficie); --btn-texto: var(--cor-aviso); --btn-borda: var(--cor-aviso); }
 .btn.alerta:hover { --btn-fundo: var(--cor-aviso-claro); }
+table.cartoes td.esconder-celular, table.cartoes td[data-label="Data"], table.cartoes td.c-hora { white-space: nowrap; }
+.btn.discreto { box-shadow: none; border-style: dashed; color: var(--texto-suave); font-weight: 550; }
+.btn.discreto:hover { color: var(--texto); transform: none; box-shadow: none; }
 .btn.peq { min-height: 36px; padding: 0 var(--e-3); font-size: .85rem; border-radius: 7px; }
 .btn.icone-so { padding: 0; width: 40px; min-height: 40px; }
 .btn.carregando { color: transparent !important; pointer-events: none; }
@@ -617,6 +620,21 @@ select.pilula { padding-right: var(--e-5); cursor: pointer; }
 .unidades-sup legend { font-size: .84rem; font-weight: 600; color: var(--texto-suave); padding: 0 var(--e-1); }
 .unidades-sup label { margin-bottom: var(--e-3); }
 
+.faixa-unidade {
+  display: flex; align-items: center; gap: var(--e-4); padding: var(--e-4) var(--e-5); margin-bottom: var(--e-5);
+  background: var(--marca-clara); border: 1px solid color-mix(in srgb, var(--marca) 25%, transparent); border-left: 5px solid var(--marca);
+  border-radius: var(--r-md); animation: entrar var(--lento) var(--suave-saida);
+}
+.faixa-unidade.todas { background: var(--superficie); border-left-color: var(--cor-neutra-500); }
+.faixa-icone { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; background: var(--marca); color: #fff; flex: 0 0 auto; }
+.faixa-unidade.todas .faixa-icone { background: var(--cor-neutra-700); }
+.faixa-icone .icone { width: 22px; height: 22px; }
+.faixa-texto { flex: 1; min-width: 0; }
+.faixa-texto b { display: block; font-size: 1.35rem; font-weight: 800; letter-spacing: -.01em; color: var(--marca-texto); line-height: 1.2; }
+.faixa-unidade.todas .faixa-texto b { color: var(--texto); }
+.faixa-texto small { display: block; color: var(--texto-suave); font-size: .82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seletor-unidade select { border-color: color-mix(in srgb, var(--marca) 45%, var(--borda)); }
+
 /* ---------- Entrada ---------- */
 .entrada { min-height: 100vh; display: grid; grid-template-columns: 1.1fr 1fr; }
 .entrada .arte {
@@ -759,6 +777,11 @@ select.pilula { padding-right: var(--e-5); cursor: pointer; }
   .kpi b { font-size: 1.35rem; }
   .kpi-icone { display: none; }
   .grafico { min-height: 190px; height: 190px; }
+  .faixa-unidade { padding: var(--e-3); gap: var(--e-3); margin-bottom: var(--e-4); }
+  .faixa-icone { width: 36px; height: 36px; }
+  .faixa-texto b { font-size: 1.1rem; }
+  .faixa-unidade .btn { padding: 0 10px; }
+  .faixa-unidade .btn .icone { display: none; }
   .grafico .coluna span { visibility: hidden; }
   .barra-filtros > *, .busca { flex: 1 1 100%; }
   .pilula.periodo { justify-content: space-between; }
