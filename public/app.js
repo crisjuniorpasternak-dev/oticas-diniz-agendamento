@@ -15,6 +15,24 @@ const STATUS = {
   faltou: 'Não compareceu',
   cancelado: 'Cancelado',
 };
+// Ícones em traço (24x24)
+const ICONES = {
+  inicio: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5"/>',
+  agendamentos: '<rect x="3" y="4.5" width="18" height="16.5" rx="2"/><path d="M3 9.5h18M8 3v3M16 3v3M7.5 13.5h3M7.5 17h6"/>',
+  novo: '<path d="M12 5v14M5 12h14"/>',
+  relatorios: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  configuracoes: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/>',
+  unidades: '<path d="M12 21s-7-5.6-7-11.5a7 7 0 0 1 14 0C19 15.4 12 21 12 21Z"/><circle cx="12" cy="9.5" r="2.5"/>',
+  sair: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H3"/>',
+  ok: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  vazio: '<rect x="3" y="4.5" width="18" height="16.5" rx="2"/><path d="M3 9.5h18M8 3v3M16 3v3M9.5 14.5l5 3M14.5 14.5l-5 3"/>',
+  anterior: '<path d="m15 6-6 6 6 6"/>',
+  proximo: '<path d="m9 6 6 6-6 6"/>',
+};
+const icone = (n) => `<svg class="icone" viewBox="0 0 24 24" aria-hidden="true">${ICONES[n] || ''}</svg>`;
+const vazio = (texto) => `<div class="vazio">${icone('vazio')}${texto}</div>`;
+const iniciais = (nome) => String(nome || '?').trim().split(/\s+/).slice(0, 2).map((p) => p[0]).join('').toUpperCase();
+
 const selo = (s) => `<span class="selo st-${s}">${STATUS[s] || s}</span>`;
 const seloOrigem = (o) => (o === 'crm' ? '<span class="selo origem-crm">CRM</span>' : '');
 
@@ -49,7 +67,9 @@ async function api(metodo, url, corpo) {
 function avisar(msg, ruim = false) {
   const el = $('#aviso');
   el.textContent = msg;
+  el.hidden = true;
   el.className = 'aviso' + (ruim ? ' ruim' : '');
+  void el.offsetWidth; // reinicia a animação de entrada
   el.hidden = false;
   clearTimeout(avisar.t);
   avisar.t = setTimeout(() => (el.hidden = true), 3500);
@@ -76,14 +96,18 @@ async function tentar(form, fn) {
   const erro = $('.erro', form);
   const botao = $('button[type=submit]', form);
   if (erro) erro.textContent = '';
-  if (botao) botao.disabled = true;
+  if (botao) botao.classList.add('carregando');
   try {
     await fn();
   } catch (e) {
-    if (erro && erro.isConnected) erro.textContent = e.message;
-    else avisar(e.message, true);
+    if (erro && erro.isConnected) {
+      erro.textContent = e.message;
+      erro.classList.remove('tremer');
+      void erro.offsetWidth;
+      erro.classList.add('tremer');
+    } else avisar(e.message, true);
   } finally {
-    if (botao) botao.disabled = false;
+    if (botao) botao.classList.remove('carregando');
   }
 }
 
@@ -110,10 +134,11 @@ const unidadeAtual = () => (ehAdmin() ? estado.unidade || '' : estado.usuario.lo
 const filtroUnidade = () => (unidadeAtual() ? `loja_id=${unidadeAtual()}` : '');
 
 function menu() {
-  const m = [['inicio', 'Início'], ['agendamentos', 'Agendamentos']];
-  if (pode('agendar')) m.push(['novo', 'Novo agendamento']);
-  if (pode('relatorios')) m.push(['relatorios', 'Relatórios']);
-  if (pode('usuarios') || pode('horarios') || pode('unidades')) m.push(['configuracoes', 'Configurações']);
+  // [rota, nome, nome curto para a barra inferior do celular]
+  const m = [['inicio', 'Início', 'Início'], ['agendamentos', 'Agendamentos', 'Agenda']];
+  if (pode('agendar')) m.push(['novo', 'Novo agendamento', 'Novo']);
+  if (pode('relatorios')) m.push(['relatorios', 'Relatórios', 'Relatórios']);
+  if (pode('usuarios') || pode('horarios') || pode('unidades')) m.push(['configuracoes', 'Configurações', 'Ajustes']);
   return m;
 }
 
@@ -144,30 +169,42 @@ async function iniciar() {
 function renderizar() {
   const [rota, sub] = rotaAtual();
   const u = estado.usuario;
+  const unidades = ehAdmin() ? [['unidades', 'Unidades', 'Unidades']] : [];
+  const itens = [...menu().slice(0, 1), ...unidades, ...menu().slice(1)];
+  const logo = `<span class="selo-logo">D</span>`;
   $('#app').innerHTML = `
-    <header class="topo">
-      <div class="marca">Óticas Diniz<small>Controle de agendamentos</small></div>
-      ${
-        ehAdmin()
-          ? `<select class="seletor-unidade" id="unidade" title="Unidade">
-              <option value="">Todas as unidades</option>
-              ${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === estado.unidade ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}
-            </select>`
-          : `<span class="seletor-unidade">${esc(estado.loja?.nome || '')}</span>`
-      }
-      <nav>${menu().map(([id, nome]) => `<a href="#/${id}" class="${id === rota ? 'ativo' : ''}">${nome}</a>`).join('')}</nav>
-      <div class="quem">
-        <span><a href="#/perfil">${esc(u.nome)}</a><br><span style="opacity:.85">${esc(u.perfil_rotulo)}</span></span>
-        <button class="btn sec peq" id="sair">Sair</button>
+    <div class="casca">
+      <aside class="lateral">
+        <div class="logo">${logo}<div class="logo-texto"><b>Óticas Diniz</b><small>Agendamentos</small></div></div>
+        <nav class="nav" aria-label="Menu principal">${itens
+          .map(([id, nome, curto]) => `<a href="#/${id}" class="nav-item ${id === rota ? 'ativo' : ''}" title="${nome}">${icone(id)}<span class="longo">${nome}</span><span class="curto">${curto}</span></a>`)
+          .join('')}</nav>
+        <div class="rodape"><a href="#" class="nav-item" data-sair title="Sair">${icone('sair')}<span>Sair</span></a></div>
+      </aside>
+      <div class="conteudo">
+        <header class="barra">
+          <a href="#/inicio" class="logo-celular" aria-label="Início">${logo}</a>
+          <div class="seletor-unidade">${icone('unidades')}${
+            ehAdmin()
+              ? `<select id="unidade" aria-label="Unidade">
+                  <option value="">Todas as unidades</option>
+                  ${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === estado.unidade ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}
+                </select>`
+              : `<span>${esc(estado.loja?.nome || '')}</span>`
+          }</div>
+          <div class="espaco"></div>
+          <a href="#/perfil" class="usuario" title="Meu perfil"><span class="nome"><b>${esc(u.nome)}</b><small>${esc(u.perfil_rotulo)}</small></span><span class="avatar">${esc(iniciais(u.nome))}</span></a>
+        </header>
+        <main id="tela"><div class="tela-carregando"><div class="esqueleto"></div><div class="esqueleto"></div><div class="esqueleto"></div></div></main>
       </div>
-    </header>
-    <main id="tela"></main>`;
-  $('#sair').onclick = async () => {
-    await api('POST', '/api/auth/logout', {});
-    estado.usuario = null;
-    location.hash = '';
-    telaEntrada();
-  };
+      <nav class="inferior" aria-label="Menu">${menu()
+        .map(([id, , curto]) =>
+          id === 'novo'
+            ? `<a href="#/novo" class="principal ${id === rota ? 'ativo' : ''}"><span class="bolha">${icone('novo')}</span><span class="rotulo">${curto}</span></a>`
+            : `<a href="#/${id}" class="${id === rota ? 'ativo' : ''}">${icone(id)}<span class="rotulo">${curto}</span></a>`
+        )
+        .join('')}</nav>
+    </div>`;
   if ($('#unidade'))
     $('#unidade').onchange = (e) => {
       estado.unidade = e.target.value ? Number(e.target.value) : null;
@@ -178,26 +215,41 @@ function renderizar() {
   TELAS[rota]($('#tela'), sub);
 }
 window.addEventListener('hashchange', () => estado.usuario && renderizar());
+document.addEventListener('click', async (e) => {
+  if (!e.target.closest('[data-sair]')) return;
+  e.preventDefault();
+  await api('POST', '/api/auth/logout', {});
+  estado.usuario = null;
+  location.hash = '';
+  telaEntrada();
+});
 
 // ---------- Entrada ----------
 function telaEntrada() {
   $('#app').innerHTML = `
-    <div class="entrada"><div class="cartao">
-      <div class="marca">Óticas Diniz<small>Controle de agendamentos</small></div>
-      <form id="f">
-        <label>E-mail<input name="email" type="email" required autocomplete="username"></label>
-        <label>Senha<input name="senha" type="password" required autocomplete="current-password"></label>
-        <p class="erro"></p>
-        <button class="btn" type="submit" style="width:100%">Entrar</button>
-      </form>
-      ${
-        estado.demo
-          ? `<div class="demo"><b>Acessos de demonstração</b> (senha <code>diniz123</code>):<br>
-             <code>admin@diniz.com</code> · <code>centro@diniz.com</code><br>
-             <code>aventureiro@diniz.com</code> · <code>recepcao.centro@diniz.com</code></div>`
-          : ''
-      }
-    </div></div>`;
+    <div class="entrada">
+      <section class="arte">
+        <div class="logo" style="display:flex;align-items:center;gap:12px"><span class="selo-logo">D</span><b style="font-size:1.1rem">Óticas Diniz</b></div>
+        <div><h1>Agendamentos de exame de vista</h1><p>Acompanhe quem foi agendado, quem compareceu e quem faltou em cada unidade.</p></div>
+      </section>
+      <section class="formulario">
+        <form id="f">
+          <h2 style="font-size:1.4rem">Entrar</h2>
+          <p class="suave" style="margin-top:-6px;margin-bottom:24px">Use o e-mail e a senha da sua unidade.</p>
+          <label>E-mail<input name="email" type="email" required autocomplete="username" placeholder="unidade@diniz.com"></label>
+          <label>Senha<input name="senha" type="password" required autocomplete="current-password"></label>
+          <p class="erro"></p>
+          <button class="btn" type="submit">Entrar</button>
+          ${
+            estado.demo
+              ? `<div class="demo"><b>Acessos de demonstração</b> (senha <code>diniz123</code>):<br>
+                 <code>admin@diniz.com</code> · <code>centro@diniz.com</code><br>
+                 <code>aventureiro@diniz.com</code> · <code>recepcao.centro@diniz.com</code></div>`
+              : ''
+          }
+        </form>
+      </section>
+    </div>`;
   const f = $('#f');
   f.onsubmit = (e) => {
     e.preventDefault();
@@ -217,16 +269,19 @@ TELAS.unidades = async (el) => {
   el.innerHTML = `
     <div class="cabeca"><div><h1>Selecione a unidade</h1><p class="suave">Agendamentos de hoje, ${diaSemana(hoje()).toLowerCase()} ${dataBR(hoje())}</p></div></div>
     <div class="unidades">
-      <button class="unidade" data-u=""><b>Todas as unidades</b><span class="suave">${estado.lojas.length} unidades</span><span class="num">${total}</span><span class="suave">agendamentos hoje</span></button>
+      <button class="unidade todas" data-u=""><span class="topo-cartao"><span class="pino">${icone('inicio')}</span><span><b>Todas as unidades</b><span class="suave">${estado.lojas.length} unidade(s)</span></span></span>
+        <span class="num">${total}</span><span class="suave">agendamentos hoje</span></button>
       ${estado.lojas
-        .map((l) => {
+        .map((l, i) => {
           const c = de(l.id);
-          return `<button class="unidade" data-u="${l.id}"><b>${esc(l.nome)}</b><span class="suave">${esc(l.cidade || l.endereco || '')}</span>
-            <span class="num">${c.total}</span><span class="suave">hoje · ${c.compareceu} compareceram · ${c.faltou} faltaram</span></button>`;
+          const base = c.total || 1;
+          return `<button class="unidade" data-u="${l.id}" style="animation-delay:${Math.min(i + 1, 8) * 40}ms"><span class="topo-cartao"><span class="pino">${icone('unidades')}</span><span><b>${esc(l.nome)}</b><span class="suave">${esc(l.cidade || l.endereco || '')}</span></span></span>
+            <span class="num">${c.total}</span><span class="suave">hoje · ${c.compareceu} compareceram · ${c.faltou} faltaram</span>
+            <span class="barra-presenca"><i class="p-ok" style="width:${(c.compareceu / base) * 100}%"></i><i class="p-falta" style="width:${(c.faltou / base) * 100}%"></i></span></button>`;
         })
         .join('')}
     </div>
-    ${!estado.lojas.length ? '<div class="cartao vazio">Nenhuma unidade cadastrada ainda. <a href="#/configuracoes/unidades">Cadastrar a primeira unidade</a></div>' : ''}`;
+    ${!estado.lojas.length ? `<div class="cartao">${vazio('Nenhuma unidade cadastrada ainda. <a href="#/configuracoes/unidades">Cadastrar a primeira unidade</a>')}</div>` : ''}`;
   $$('[data-u]', el).forEach(
     (b) =>
       (b.onclick = () => {
@@ -242,15 +297,15 @@ TELAS.inicio = async (el) => {
   const st = (TELAS.inicio.st ||= { mes: hoje().slice(0, 7), dia: hoje() });
   const tituloUnidade = unidadeAtual() ? nomeLoja(unidadeAtual()) : 'Todas as unidades';
   el.innerHTML = `
-    <div class="cabeca"><div><h1>${esc(tituloUnidade)}</h1><p class="suave" style="margin:0">Hoje é ${diaSemana(hoje()).toLowerCase()}, ${dataBR(hoje())}</p></div>
-      ${pode('agendar') ? '<a class="btn" href="#/novo">+ Novo agendamento</a>' : ''}</div>
-    <div class="metricas" id="hoje"></div>
+    <div class="cabeca"><div><h1>${esc(tituloUnidade)}</h1><p class="suave">Hoje é ${diaSemana(hoje()).toLowerCase()}, ${dataBR(hoje())}</p></div>
+      ${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo agendamento</a>` : ''}</div>
+    <div class="metricas" id="hoje">${'<div class="metrica carregando"><b>00</b><span>carregando</span></div>'.repeat(5)}</div>
     <div class="painel">
       <div class="cartao">
         <div class="calendario-topo">
-          <button class="btn sec peq" id="mes-ant" aria-label="Mês anterior">‹</button>
+          <button class="btn sec icone-so" id="mes-ant" aria-label="Mês anterior">${icone('anterior')}</button>
           <h2 id="mes-nome"></h2>
-          <button class="btn sec peq" id="mes-prox" aria-label="Próximo mês">›</button>
+          <button class="btn sec icone-so" id="mes-prox" aria-label="Próximo mês">${icone('proximo')}</button>
         </div>
         <div class="calendario" id="cal"></div>
       </div>
@@ -267,10 +322,10 @@ TELAS.inicio = async (el) => {
     const x = c || { total: 0, agendado: 0, confirmado: 0, compareceu: 0, faltou: 0, cancelado: 0 };
     $('#hoje').innerHTML = [
       ['Agendamentos hoje', x.total - x.cancelado, 'destaque'],
-      ['Aguardando', x.agendado + x.confirmado],
-      ['Compareceram', x.compareceu],
-      ['Não compareceram', x.faltou],
-      ['Cancelados', x.cancelado],
+      ['Aguardando', x.agendado + x.confirmado, 't-espera'],
+      ['Compareceram', x.compareceu, 't-ok'],
+      ['Não compareceram', x.faltou, 't-falta'],
+      ['Cancelados', x.cancelado, 't-neutro'],
     ]
       .map(([n, v, cl]) => `<div class="metrica ${cl || ''}"><b>${v}</b><span>${n}</span></div>`)
       .join('');
@@ -280,9 +335,9 @@ TELAS.inicio = async (el) => {
     const lista = await api('GET', `/api/agendamentos/contagem?data_inicio=${hoje()}&data_fim=${somarDias(hoje(), 13)}&status=agendado,confirmado&${f}`);
     $('#proximos').innerHTML = lista.length
       ? lista
-          .map((d) => `<li data-dia="${d.data}"><span>${d.data === hoje() ? '<b>Hoje</b>' : `${diaSemana(d.data)}, ${dataBR(d.data).slice(0, 5)}`}</span><b>${d.total} agendamento${d.total > 1 ? 's' : ''}</b></li>`)
+          .map((d) => `<li data-dia="${d.data}"><span>${d.data === hoje() ? '<b>Hoje</b>' : `${diaSemana(d.data)}, ${dataBR(d.data).slice(0, 5)}`}</span><span class="contador">${d.total}</span></li>`)
           .join('')
-      : '<li class="suave">Nenhum agendamento nos próximos 14 dias.</li>';
+      : `<li class="suave" style="cursor:default">Nenhum agendamento nos próximos 14 dias.</li>`;
     $$('#proximos [data-dia]').forEach((li) => (li.onclick = () => escolherDia(li.dataset.dia)));
   };
 
@@ -303,7 +358,7 @@ TELAS.inicio = async (el) => {
           const cls = [d.slice(0, 7) !== st.mes ? 'fora' : '', d === hoje() ? 'hoje' : '', d === st.dia ? 'sel' : ''].join(' ');
           return `<button class="${cls}" data-dia="${d}"><span class="dia">${Number(d.slice(8))}</span>
             ${ativos ? `<span class="qtd">${ativos}</span>` : ''}
-            ${c && (c.compareceu || c.faltou) ? `<span class="pres">✓${c.compareceu} ✗${c.faltou}</span>` : ''}</button>`;
+            ${c && (c.compareceu || c.faltou) ? `<span class="pres"><span class="ok">✓ ${c.compareceu}</span><span class="falta">✗ ${c.faltou}</span></span>` : ''}</button>`;
         })
         .join('');
     $$('#cal [data-dia]').forEach((b) => (b.onclick = () => escolherDia(b.dataset.dia)));
@@ -311,7 +366,7 @@ TELAS.inicio = async (el) => {
 
   const carregarDia = async () => {
     const lista = await api('GET', `/api/agendamentos?data_inicio=${st.dia}&data_fim=${st.dia}&${f}`);
-    $('#dia').innerHTML = `<div class="cabeca"><h2 style="margin:0">${st.dia === hoje() ? 'Hoje' : diaSemana(st.dia)}, ${dataBR(st.dia)} · ${lista.filter((a) => a.status !== 'cancelado').length} agendamento(s)</h2></div>
+    $('#dia').innerHTML = `<div class="cabeca" style="margin-bottom:12px"><h2 style="margin:0">${st.dia === hoje() ? 'Hoje' : diaSemana(st.dia)}, ${dataBR(st.dia)} · ${lista.filter((a) => a.status !== 'cancelado').length} agendamento(s)</h2></div>
       ${tabelaAgendamentos(lista, { rapido: true })}`;
     ligarTabela($('#dia'), lista, recarregar);
   };
@@ -335,20 +390,20 @@ TELAS.inicio = async (el) => {
 
 // Tabela de agendamentos com botões rápidos de presença
 function tabelaAgendamentos(lista, { rapido = false, comData = false } = {}) {
-  if (!lista.length) return '<div class="vazio">Nenhum agendamento.</div>';
+  if (!lista.length) return vazio('Nenhum agendamento.');
   const todas = !unidadeAtual();
-  return `<table><thead><tr>${comData ? '<th>Data</th>' : ''}<th>Hora</th><th>Cliente</th><th class="esconder-celular">Telefone</th>
-      ${todas ? '<th class="esconder-celular">Unidade</th>' : ''}<th>Status</th>${rapido ? '<th>Presença</th>' : ''}</tr></thead>
+  return `<table class="cartoes"><thead><tr>${comData ? '<th>Data</th>' : ''}<th>Hora</th><th>Cliente</th><th class="esconder-celular">Telefone</th>
+      ${todas ? '<th>Unidade</th>' : ''}<th>Status</th>${rapido ? '<th>Presença</th>' : ''}</tr></thead>
     <tbody>${lista
       .map(
-        (a) => `<tr class="clicavel" data-id="${a.id}">${comData ? `<td>${dataBR(a.data)}</td>` : ''}<td><b>${a.hora}</b></td>
-        <td>${esc(a.cliente_nome)} ${seloOrigem(a.origem)}</td><td class="esconder-celular">${esc(a.cliente_telefone || '')}</td>
-        ${todas ? `<td class="esconder-celular">${esc(a.loja_nome)}</td>` : ''}<td>${selo(a.status)}</td>
+        (a) => `<tr class="clicavel" data-id="${a.id}">${comData ? `<td data-label="Data">${dataBR(a.data)}</td>` : ''}<td class="c-hora"><b>${a.hora}</b></td>
+        <td class="c-nome">${esc(a.cliente_nome)} ${seloOrigem(a.origem)}</td><td class="esconder-celular">${esc(a.cliente_telefone || '')}</td>
+        ${todas ? `<td data-label="Unidade">${esc(a.loja_nome)}</td>` : ''}<td class="c-status">${selo(a.status)}</td>
         ${
           rapido
             ? `<td class="acoes">${
                 ['agendado', 'confirmado'].includes(a.status) && a.data <= hoje()
-                  ? `<button class="btn ok peq" data-rapido="compareceu" data-ag="${a.id}">Compareceu</button>
+                  ? `<button class="btn ok peq" data-rapido="compareceu" data-ag="${a.id}">${icone('ok')} Compareceu</button>
                      ${jaPassou(a) ? `<button class="btn alerta peq" data-rapido="faltou" data-ag="${a.id}">Faltou</button>` : ''}`
                   : ''
               }</td>`
@@ -364,11 +419,13 @@ function ligarTabela(raiz, lista, aoMudar) {
     (b) =>
       (b.onclick = async (e) => {
         e.stopPropagation();
+        b.classList.add('carregando');
         try {
           await api('PATCH', `/api/agendamentos/${b.dataset.ag}/status`, { status: b.dataset.rapido });
           avisar(b.dataset.rapido === 'compareceu' ? 'Presença registrada.' : 'Falta registrada.');
           aoMudar();
         } catch (err) {
+          b.classList.remove('carregando');
           avisar(err.message, true);
         }
       })
@@ -447,7 +504,7 @@ function seletorHorario(cont, { lojaId, aoEscolher }) {
     $('#sh-lista', cont).innerHTML = lista.length
       ? `<p class="suave">${diaSemana(data)}, ${dataBR(data)}: escolha um horário</p>
          <div class="horarios">${lista.map((s) => `<button type="button" data-h="${s.hora}">${s.hora}<small>${s.vagas} vaga${s.vagas > 1 ? 's' : ''}</small></button>`).join('')}</div>`
-      : '<div class="vazio">Sem horários livres nesta data.</div>';
+      : vazio('Sem horários livres nesta data.');
     $$('[data-h]', cont).forEach(
       (b) =>
         (b.onclick = () => {
@@ -492,7 +549,7 @@ function telaRemarcar(a, aoMudar) {
 TELAS.agendamentos = async (el) => {
   const st = (TELAS.agendamentos.st ||= { inicio: hoje(), fim: somarDias(hoje(), 30), status: '', origem: '', busca: '' });
   el.innerHTML = `
-    <div class="cabeca"><h1>Agendamentos</h1><div class="acoes"><button class="btn sec" id="csv">Exportar planilha</button>${pode('agendar') ? '<a class="btn" href="#/novo">+ Novo</a>' : ''}</div></div>
+    <div class="cabeca"><div><h1>Agendamentos</h1><p class="suave">Filtre por período, status ou cliente</p></div><div class="acoes"><button class="btn sec" id="csv">Exportar planilha</button>${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo</a>` : ''}</div></div>
     <div class="cartao"><div class="linha">
       <label>De<input type="date" id="f-ini" value="${st.inicio}"></label>
       <label>Até<input type="date" id="f-fim" value="${st.fim}"></label>
@@ -510,7 +567,7 @@ TELAS.agendamentos = async (el) => {
     if (unidadeAtual()) q.set('loja_id', unidadeAtual());
     for (const k of ['status', 'origem', 'busca']) if (st[k]) q.set(k, st[k]);
     lista = await api('GET', '/api/agendamentos?' + q);
-    $('#lista').innerHTML = `<p class="suave">${lista.length} agendamento(s)</p>` + tabelaAgendamentos(lista, { rapido: true, comData: true });
+    $('#lista').innerHTML = `<p class="suave" style="margin-top:0">${lista.length} agendamento(s)</p>` + tabelaAgendamentos(lista, { rapido: true, comData: true });
     ligarTabela($('#lista'), lista, carregar);
   };
   let t;
@@ -536,18 +593,18 @@ TELAS.agendamentos = async (el) => {
 TELAS.novo = (el) => {
   const st = { cliente: null, escolha: null, loja: unidadeAtual() || (estado.lojas.length === 1 ? estado.lojas[0].id : null) };
   el.innerHTML = `
-    <h1>Novo agendamento</h1>
+    <div class="cabeca"><div><h1>Novo agendamento</h1><p class="suave">Escolha o cliente, o dia e o horário</p></div></div>
     <div class="cartao" style="max-width:820px">
       ${
         ehAdmin()
           ? `<label>Unidade<select id="n-loja"><option value="">Escolha a unidade</option>${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === st.loja ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}</select></label>`
           : ''
       }
-      <h3>Cliente</h3>
+      <h3 class="passo" style="margin-top:0"><i>1</i> Cliente</h3>
       <label>Buscar cliente já cadastrado (nome ou telefone)<input id="n-busca" placeholder="Digite ao menos 2 letras ou 4 números"></label>
       <div id="n-res"></div>
       <div id="n-cliente"></div>
-      <h3 style="margin-top:12px">Data e horário</h3>
+      <h3 class="passo"><i>2</i> Data e horário</h3>
       <div id="n-horario"></div>
       <form id="n-form">
         <label>Observações (opcional)<textarea name="observacoes" rows="2"></textarea></label>
@@ -567,7 +624,7 @@ TELAS.novo = (el) => {
     st.cliente = c;
     $('#n-res').innerHTML = '';
     $('#n-busca').value = '';
-    $('#n-cliente').innerHTML = `<p>Cliente: <b>${esc(c.nome)}</b> ${esc(c.telefone || '')} · <a href="#" id="c-trocar">trocar</a></p>`;
+    $('#n-cliente').innerHTML = `<div class="cliente-escolhido"><span class="avatar">${esc(iniciais(c.nome))}</span><div style="flex:1"><b>${esc(c.nome)}</b><br><span class="suave">${esc(c.telefone || '')}</span></div><a href="#" id="c-trocar">Trocar</a></div>`;
     $('#c-trocar').onclick = (e) => {
       e.preventDefault();
       formNovoCliente();
@@ -583,7 +640,7 @@ TELAS.novo = (el) => {
       if (termo.length < 2) return ($('#n-res').innerHTML = '');
       const lista = await api('GET', '/api/clientes?busca=' + encodeURIComponent(termo));
       $('#n-res').innerHTML = lista.length
-        ? `<table><tbody>${lista.map((c) => `<tr class="clicavel" data-c="${c.id}"><td><b>${esc(c.nome)}</b></td><td>${esc(c.telefone || '')}</td></tr>`).join('')}</tbody></table>`
+        ? `<table style="margin-bottom:16px"><tbody>${lista.map((c) => `<tr class="clicavel" data-c="${c.id}"><td><b>${esc(c.nome)}</b></td><td>${esc(c.telefone || '')}</td></tr>`).join('')}</tbody></table>`
         : '<p class="suave">Nenhum cliente encontrado. Preencha os dados abaixo para cadastrar.</p>';
       $$('[data-c]', $('#n-res')).forEach((tr) => (tr.onclick = () => clienteEscolhido(lista.find((c) => c.id === Number(tr.dataset.c)))));
     }, 300);
@@ -616,7 +673,8 @@ TELAS.novo = (el) => {
       }
       const ag = await api('POST', '/api/agendamentos', corpo);
       el.innerHTML = `<div class="cartao" style="max-width:560px">
-        <h1>Agendamento confirmado ✓</h1>
+        <div class="confirmado-icone">${icone('ok')}</div>
+        <h1>Agendamento confirmado</h1>
         <dl class="detalhe">
           <dt>Cliente</dt><dd>${esc(ag.cliente_nome)}</dd>
           <dt>Quando</dt><dd>${diaSemana(ag.data)}, ${dataBR(ag.data)} às ${ag.hora}</dd>
@@ -632,7 +690,7 @@ TELAS.novo = (el) => {
 // ---------- Relatórios ----------
 TELAS.relatorios = async (el) => {
   el.innerHTML = `
-    <h1>Relatórios</h1>
+    <div class="cabeca"><div><h1>Relatórios</h1><p class="suave">Comparecimento por período, unidade e origem</p></div></div>
     <div class="cartao"><div class="linha">
       <label>De<input type="date" id="ini" value="${somarDias(hoje(), -30)}"></label>
       <label>Até<input type="date" id="fim" value="${hoje()}"></label>
@@ -649,16 +707,16 @@ TELAS.relatorios = async (el) => {
         linhas.length
           ? `<table><thead><tr><th>${nome}</th><th>Agendados</th><th>Compareceram</th><th>Não compareceram</th><th>Cancelados</th><th>Comparecimento</th></tr></thead><tbody>
             ${linhas.map((l) => `<tr><td>${esc(l.nome)}</td><td>${l.total}</td><td>${l.compareceu}</td><td>${l.faltou}</td><td>${l.cancelado}</td><td><b>${pct(l.compareceu, l.compareceu + l.faltou)}</b></td></tr>`).join('')}</tbody></table>`
-          : '<div class="vazio">Sem dados no período.</div>'
+          : vazio('Sem dados no período.')
       }</div>`;
     $('#res').innerHTML = `
       <div class="metricas">
         <div class="metrica destaque"><b>${pct(g.compareceu, g.compareceu + g.faltou)}</b><span>Taxa de comparecimento</span></div>
-        <div class="metrica"><b>${g.total}</b><span>Agendamentos</span></div>
-        <div class="metrica"><b>${g.compareceu || 0}</b><span>Compareceram</span></div>
-        <div class="metrica"><b>${g.faltou || 0}</b><span>Não compareceram</span></div>
-        <div class="metrica"><b>${g.cancelado || 0}</b><span>Cancelados</span></div>
-        <div class="metrica"><b>${(g.agendado || 0) + (g.confirmado || 0)}</b><span>Sem registro de presença</span></div>
+        <div class="metrica t-neutro"><b>${g.total}</b><span>Agendamentos</span></div>
+        <div class="metrica t-ok"><b>${g.compareceu || 0}</b><span>Compareceram</span></div>
+        <div class="metrica t-falta"><b>${g.faltou || 0}</b><span>Não compareceram</span></div>
+        <div class="metrica t-neutro"><b>${g.cancelado || 0}</b><span>Cancelados</span></div>
+        <div class="metrica t-espera"><b>${(g.agendado || 0) + (g.confirmado || 0)}</b><span>Sem registro de presença</span></div>
       </div>
       ${!unidadeAtual() ? tabela('Por unidade', r.por_unidade, 'Unidade') : ''}
       ${tabela('Por origem', r.por_origem.map((o) => ({ ...o, nome: o.origem === 'crm' ? 'CRM (Datacrazy)' : 'Sistema' })), 'Origem')}`;
@@ -680,7 +738,7 @@ const CONFIG = {};
 TELAS.configuracoes = (el, sub) => {
   const abas = ABAS.filter(([, , ok]) => ok());
   const atual = abas.some(([id]) => id === sub) ? sub : abas[0][0];
-  el.innerHTML = `<h1>Configurações</h1>
+  el.innerHTML = `<div class="cabeca"><div><h1>Configurações</h1><p class="suave">Unidades, acessos, horários e integração</p></div></div>
     <nav class="abas">${abas.map(([id, nome]) => `<a href="#/configuracoes/${id}" class="${id === atual ? 'ativo' : ''}">${nome}</a>`).join('')}</nav>
     <div id="aba"></div>`;
   CONFIG[atual]($('#aba'));
@@ -702,7 +760,7 @@ CONFIG.unidades = async (el) => {
             <td>${l.duracao_consulta} min · ${l.vagas_por_horario} vaga(s) por horário</td><td>${l.ativa ? 'Ativa' : 'Inativa'}</td></tr>`
           )
           .join('')}</tbody></table>`
-          : '<div class="vazio">Nenhuma unidade cadastrada.</div>'
+          : vazio('Nenhuma unidade cadastrada.')
       }
     </div>`;
   const recarregar = async () => {
@@ -843,7 +901,7 @@ function formUsuario(u, aoSalvar) {
 // Horários da unidade e bloqueios
 CONFIG.horarios = async (el) => {
   const lojaId = unidadeAtual() || estado.lojas[0]?.id;
-  if (!lojaId) return (el.innerHTML = '<div class="cartao vazio">Cadastre uma unidade primeiro.</div>');
+  if (!lojaId) return (el.innerHTML = `<div class="cartao">${vazio('Cadastre uma unidade primeiro.')}</div>`);
   const [{ loja, horarios }, bloqueios] = await Promise.all([api('GET', `/api/lojas/${lojaId}/horarios`), api('GET', `/api/bloqueios?loja_id=${lojaId}`)]);
   const doDia = (d) => horarios.find((h) => h.dia_semana === d);
   el.innerHTML = `
@@ -1012,9 +1070,9 @@ CONFIG.logs = async (el) => {
 TELAS.perfil = (el) => {
   const u = estado.usuario;
   el.innerHTML = `
-    <h1>Meu perfil</h1>
+    <div class="cabeca"><div><h1>Meu perfil</h1></div></div>
     <div class="cartao" style="max-width:560px">
-      <p class="suave">${esc(u.perfil_rotulo)}${estado.loja ? ' · ' + esc(estado.loja.nome) : ''} · ${esc(u.email)}</p>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px"><span class="avatar" style="width:48px;height:48px;font-size:1rem">${esc(iniciais(u.nome))}</span><div><b>${esc(u.nome)}</b><p class="suave" style="margin:0">${esc(u.perfil_rotulo)}${estado.loja ? ' · ' + esc(estado.loja.nome) : ''} · ${esc(u.email)}</p></div></div>
       <form id="fp">
         <label>Nome<input name="nome" required value="${esc(u.nome)}"></label>
         <label>Telefone<input name="telefone" value="${esc(u.telefone || '')}"></label>
@@ -1022,7 +1080,7 @@ TELAS.perfil = (el) => {
         <div class="linha"><label>Senha atual<input type="password" name="senha_atual" autocomplete="current-password"></label>
         <label>Nova senha<input type="password" name="nova_senha" minlength="8" autocomplete="new-password"></label></div>
         <p class="erro"></p>
-        <button class="btn" type="submit">Salvar</button>
+        <div class="acoes"><button class="btn" type="submit">Salvar</button><button class="btn sec" type="button" data-sair>${icone('sair')} Sair</button></div>
       </form>
     </div>`;
   const f = $('#fp');
