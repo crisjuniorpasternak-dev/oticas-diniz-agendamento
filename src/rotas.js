@@ -3,11 +3,13 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const path = require('path');
 const bcrypt = require('bcryptjs');
-const { PERFIS, PERMISSOES, PODE_GERENCIAR, tem } = require('./permissoes');
+const { criarUnidade, configuracao, definirConfiguracao, novoToken } = require('./db');
+const { PERFIS, ehAdmin, ehPrincipal, podeAgendar, perfisGerenciaveis, permissoes } = require('./permissoes');
 const agenda = require('./agenda');
+const integracao = require('./integracao');
 
 const DURACAO_SESSAO_H = 12;
-const ANTECEDENCIA_CANCELAMENTO_CLIENTE_MIN = 120;
+const STATUS = ['agendado', 'confirmado', 'compareceu', 'faltou', 'cancelado'];
 
 class ErroHttp extends Error {
   constructor(status, mensagem) {
@@ -19,14 +21,18 @@ const falha = (status, msg) => {
   throw new ErroHttp(status, msg);
 };
 
-function criarApp(db, { agora = () => new Date() } = {}) {
+function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '100kb' }));
+  app.use(express.json({ limit: '200kb' }));
   app.use(cookieParser());
 
+  const WEBHOOK = '/api/integracoes/crm/webhook';
+
   // Proteção simples contra CSRF: escrita na API só aceita JSON (exige preflight CORS).
+  // O webhook do CRM é autenticado por token e pode vir como formulário.
   app.use('/api', (req, res, next) => {
+    if (req.originalUrl.startsWith(WEBHOOK)) return next();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !req.is('application/json')) {
       return res.status(415).json({ erro: 'Envie os dados em JSON.' });
     }
@@ -34,7 +40,14 @@ function criarApp(db, { agora = () => new Date() } = {}) {
   });
 
   const auditar = async (usuarioId, acao, entidade, entidadeId, detalhes) =>
-    (await db.run('INSERT INTO auditoria (usuario_id, acao, entidade, entidade_id, detalhes) VALUES (?,?,?,?,?)', usuarioId ?? null, acao, entidade ?? null, entidadeId ?? null, detalhes ? JSON.stringify(detalhes) : null));
+    db.run(
+      'INSERT INTO auditoria (usuario_id, acao, entidade, entidade_id, detalhes) VALUES (?,?,?,?,?)',
+      usuarioId ?? null,
+      acao,
+      entidade ?? null,
+      entidadeId ?? null,
+      detalhes ? JSON.stringify(detalhes) : null
+    );
 
   const usuarioPublico = (u) =>
     u && {
@@ -42,12 +55,11 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       nome: u.nome,
       email: u.email,
       telefone: u.telefone,
-      cpf: u.cpf,
-      data_nascimento: u.data_nascimento,
       perfil: u.perfil,
-      perfil_rotulo: PERFIS[u.perfil].rotulo,
+      perfil_rotulo: ehPrincipal(u) ? 'Administrador principal' : PERFIS[u.perfil]?.rotulo,
       loja_id: u.loja_id,
-      registro_profissional: u.registro_profissional,
+      pode_agendar: podeAgendar(u),
+      principal: !!u.principal,
       ativo: !!u.ativo,
       criado_em: u.criado_em,
     };
@@ -56,28 +68,34 @@ function criarApp(db, { agora = () => new Date() } = {}) {
   app.use(async (req, res, next) => {
     const token = req.cookies.sessao;
     if (token) {
-      const u = (await db.get(`SELECT u.* FROM sessoes s JOIN usuarios u ON u.id = s.usuario_id
-           WHERE s.token = ? AND s.expira_em > datetime('now') AND u.ativo = 1`, token));
+      const u = await db.get(
+        `SELECT u.* FROM sessoes s JOIN usuarios u ON u.id = s.usuario_id
+         WHERE s.token = ? AND s.expira_em > datetime('now') AND u.ativo = 1`,
+        token
+      );
       if (u) req.usuario = u;
     }
     next();
   });
 
   const exigirLogin = (req, res, next) => (req.usuario ? next() : res.status(401).json({ erro: 'Faça login para continuar.' }));
-  const exigir = (...permissoes) => [
+  const exigir = (permissao) => [
     exigirLogin,
     (req, res, next) =>
-      permissoes.some((p) => tem(req.usuario, p)) ? next() : res.status(403).json({ erro: 'Seu perfil não tem acesso a esta função.' }),
+      permissoes(req.usuario)[permissao] ? next() : res.status(403).json({ erro: 'Seu perfil não tem acesso a esta função.' }),
   ];
 
   const abrirSessao = async (res, usuarioId) => {
     const token = crypto.randomBytes(32).toString('hex');
-    (await db.run(`INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, datetime('now', '+${DURACAO_SESSAO_H} hours'))`, token,
-      usuarioId));
+    await db.run(
+      `INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, datetime('now', '+${DURACAO_SESSAO_H} hours'))`,
+      token,
+      usuarioId
+    );
     res.cookie('sessao', token, {
       httpOnly: true,
       sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
+      secure: process.env.NODE_ENV === 'production' || !!process.env.VERCEL,
       maxAge: DURACAO_SESSAO_H * 3600 * 1000,
     });
   };
@@ -87,21 +105,21 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     const email = String(req.body.email || '').trim().toLowerCase();
     const t = tentativas.get(email);
     if (t && t.ate > Date.now()) return res.status(429).json({ erro: 'Muitas tentativas. Aguarde alguns minutos.' });
-    const u = (await db.get('SELECT * FROM usuarios WHERE email = ?', email));
+    const u = await db.get('SELECT * FROM usuarios WHERE email = ?', email);
     if (!u || !u.ativo || !bcrypt.compareSync(String(req.body.senha || ''), u.senha_hash)) {
       const n = (t?.n || 0) + 1;
       tentativas.set(email, { n, ate: n >= 5 ? Date.now() + 5 * 60 * 1000 : 0 });
       return res.status(401).json({ erro: 'E-mail ou senha inválidos.' });
     }
     tentativas.delete(email);
-    (await db.run("DELETE FROM sessoes WHERE expira_em <= datetime('now')"));
+    await db.run("DELETE FROM sessoes WHERE expira_em <= datetime('now')");
     await abrirSessao(res, u.id);
     await auditar(u.id, 'login', 'usuario', u.id);
-    res.json({ usuario: usuarioPublico(u), permissoes: PERMISSOES[u.perfil] });
+    res.json({ usuario: usuarioPublico(u), permissoes: permissoes(u) });
   });
 
   app.post('/api/auth/logout', async (req, res) => {
-    if (req.cookies.sessao) (await db.run('DELETE FROM sessoes WHERE token = ?', req.cookies.sessao));
+    if (req.cookies.sessao) await db.run('DELETE FROM sessoes WHERE token = ?', req.cookies.sessao);
     res.clearCookie('sessao');
     res.json({ ok: true });
   });
@@ -109,23 +127,11 @@ function criarApp(db, { agora = () => new Date() } = {}) {
   app.get('/api/auth/me', async (req, res) => {
     if (!req.usuario) {
       // Mostra os acessos de demonstração na tela de login só quando o banco é o de demonstração
-      const demo = !!(await db.get("SELECT 1 FROM usuarios WHERE email = 'cliente@exemplo.com'"));
+      const demo = !!(await db.get("SELECT 1 FROM usuarios WHERE email = 'admin@diniz.com'")) && !process.env.VERCEL;
       return res.json({ usuario: null, demo });
     }
-    const loja = req.usuario.loja_id ? (await db.get('SELECT id, nome FROM lojas WHERE id = ?', req.usuario.loja_id)) : null;
-    res.json({ usuario: usuarioPublico(req.usuario), loja, permissoes: PERMISSOES[req.usuario.perfil] });
-  });
-
-  // Autocadastro de clientes
-  app.post('/api/auth/cadastro', async (req, res) => {
-    const dados = validarDadosUsuario(req.body, { novo: true });
-    if ((await db.get('SELECT 1 FROM usuarios WHERE email = ?', dados.email))) falha(409, 'Já existe uma conta com este e-mail.');
-    const id = (await db.run('INSERT INTO usuarios (nome, email, senha_hash, telefone, cpf, data_nascimento, perfil) VALUES (?,?,?,?,?,?,?)', dados.nome, dados.email, bcrypt.hashSync(dados.senha, 10), dados.telefone, dados.cpf, dados.data_nascimento, 'cliente'))
-      .lastInsertRowid;
-    await auditar(id, 'autocadastro', 'usuario', id);
-    await abrirSessao(res, id);
-    const u = (await db.get('SELECT * FROM usuarios WHERE id = ?', id));
-    res.status(201).json({ usuario: usuarioPublico(u), permissoes: PERMISSOES.cliente });
+    const loja = req.usuario.loja_id ? await db.get('SELECT id, nome FROM lojas WHERE id = ?', req.usuario.loja_id) : null;
+    res.json({ usuario: usuarioPublico(req.usuario), loja, permissoes: permissoes(req.usuario) });
   });
 
   app.put('/api/perfil', exigirLogin, async (req, res) => {
@@ -139,357 +145,385 @@ function criarApp(db, { agora = () => new Date() } = {}) {
       if (String(req.body.nova_senha).length < 8) falha(400, 'A nova senha deve ter ao menos 8 caracteres.');
       hash = bcrypt.hashSync(String(req.body.nova_senha), 10);
     }
-    (await db.run('UPDATE usuarios SET nome = ?, telefone = ?, senha_hash = ? WHERE id = ?', nome, telefone, hash, u.id));
+    await db.run('UPDATE usuarios SET nome = ?, telefone = ?, senha_hash = ? WHERE id = ?', nome, telefone, hash, u.id);
     await auditar(u.id, 'editar_perfil', 'usuario', u.id);
-    res.json({ usuario: usuarioPublico((await db.get('SELECT * FROM usuarios WHERE id = ?', u.id))) });
+    res.json({ usuario: usuarioPublico(await db.get('SELECT * FROM usuarios WHERE id = ?', u.id)) });
   });
 
-  app.get('/api/saude', async (req, res) => res.json({ ok: true }));
+  app.get('/api/saude', (req, res) => res.json({ ok: true }));
 
-  app.get('/api/perfis', async (req, res) => res.json({ perfis: PERFIS, permissoes: PERMISSOES }));
-
-  // ---------- Lojas ----------
-  app.get('/api/lojas', async (req, res) => {
-    const todas = tem(req.usuario, 'lojas.gerenciar') && req.query.todas === '1';
-    res.json((await db.all(`SELECT * FROM lojas ${todas ? '' : 'WHERE ativa = 1'} ORDER BY nome`)));
-  });
-
-  const validarLoja = (b) => {
-    const nome = String(b.nome || '').trim();
-    if (!nome) falha(400, 'Informe o nome da loja.');
-    const abertura = b.hora_abertura || '09:00';
-    const fechamento = b.hora_fechamento || '18:00';
-    if (!agenda.horaValida(abertura) || !agenda.horaValida(fechamento) || abertura >= fechamento)
-      falha(400, 'Horário de funcionamento inválido.');
-    const dur = Number(b.duracao_consulta || 30);
-    if (!Number.isInteger(dur) || dur < 10 || dur > 180) falha(400, 'A duração da consulta deve ficar entre 10 e 180 minutos.');
-    return [nome, b.endereco || null, b.cidade || null, b.telefone || null, abertura, fechamento, dur, b.ativa === false ? 0 : 1];
+  // ---------- Escopo por unidade ----------
+  // Administrador escolhe a unidade (ou todas); os demais ficam presos à sua.
+  const lojaDoEscopo = (u, lojaPedida) => (ehAdmin(u) ? (lojaPedida ? Number(lojaPedida) : null) : u.loja_id);
+  const garantirLoja = (u, lojaId) => {
+    if (!ehAdmin(u) && Number(lojaId) !== u.loja_id) falha(403, 'Você só tem acesso à sua unidade.');
   };
 
-  app.post('/api/lojas', exigir('lojas.gerenciar'), async (req, res) => {
-    const id = (await db.run('INSERT INTO lojas (nome, endereco, cidade, telefone, hora_abertura, hora_fechamento, duracao_consulta, ativa) VALUES (?,?,?,?,?,?,?,?)', ...validarLoja(req.body))).lastInsertRowid;
-    await auditar(req.usuario.id, 'criar', 'loja', id, req.body);
-    res.status(201).json((await db.get('SELECT * FROM lojas WHERE id = ?', id)));
+  // ---------- Unidades ----------
+  app.get('/api/lojas', exigirLogin, async (req, res) => {
+    const u = req.usuario;
+    if (!ehAdmin(u)) return res.json(await db.all('SELECT * FROM lojas WHERE id = ?', u.loja_id));
+    const todas = req.query.todas === '1';
+    res.json(await db.all(`SELECT * FROM lojas ${todas ? '' : 'WHERE ativa = 1'} ORDER BY nome`));
   });
 
-  app.put('/api/lojas/:id', exigir('lojas.gerenciar'), async (req, res) => {
-    const id = Number(req.params.id);
-    if (!(await db.get('SELECT 1 FROM lojas WHERE id = ?', id))) falha(404, 'Loja não encontrada.');
-    (await db.run('UPDATE lojas SET nome=?, endereco=?, cidade=?, telefone=?, hora_abertura=?, hora_fechamento=?, duracao_consulta=?, ativa=? WHERE id=?', ...validarLoja(req.body), id));
-    await auditar(req.usuario.id, 'editar', 'loja', id, req.body);
-    res.json((await db.get('SELECT * FROM lojas WHERE id = ?', id)));
-  });
-
-  // ---------- Usuários ----------
-  function validarDadosUsuario(b, { novo }) {
-    const nome = String(b.nome || '').trim();
-    const email = String(b.email || '').trim().toLowerCase();
-    if (!nome) falha(400, 'Informe o nome.');
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) falha(400, 'Informe um e-mail válido.');
-    const senha = b.senha ? String(b.senha) : null;
-    if (novo && !senha) falha(400, 'Informe uma senha.');
-    if (senha && senha.length < 8) falha(400, 'A senha deve ter ao menos 8 caracteres.');
-    const cpf = b.cpf ? String(b.cpf).replace(/\D/g, '') : null;
-    if (cpf && cpf.length !== 11) falha(400, 'CPF deve ter 11 dígitos.');
-    const data_nascimento = b.data_nascimento || null;
-    if (data_nascimento && !agenda.dataValida(data_nascimento)) falha(400, 'Data de nascimento inválida.');
-    return { nome, email, senha, cpf, data_nascimento, telefone: b.telefone ? String(b.telefone).trim() : null };
-  }
-
-  // Um usuário está no escopo de quem o gerencia?
-  function noEscopo(eu, alvo) {
-    if (!PODE_GERENCIAR[eu.perfil].includes(alvo.perfil)) return false;
-    if (eu.perfil === 'admin' || alvo.perfil === 'cliente') return true;
-    return alvo.loja_id === eu.loja_id;
-  }
-
-  async function resolverLojaDoUsuario(eu, perfil, lojaId) {
-    if (perfil === 'cliente' || perfil === 'admin') return null;
-    const id = eu.perfil === 'admin' ? Number(lojaId) : eu.loja_id;
-    if (!id || !(await db.get('SELECT 1 FROM lojas WHERE id = ?', id))) falha(400, 'Escolha a loja deste funcionário.');
-    return id;
-  }
-
-  app.get('/api/usuarios', exigir('usuarios.gerenciar', 'clientes.ver'), async (req, res) => {
-    const eu = req.usuario;
-    const filtros = [];
-    const params = [];
-    const visiveis = tem(eu, 'usuarios.gerenciar') ? PODE_GERENCIAR[eu.perfil] : ['cliente'];
-    let perfis = visiveis;
-    if (req.query.perfil) perfis = visiveis.filter((p) => p === req.query.perfil);
-    if (!perfis.length) return res.json([]);
-    filtros.push(`perfil IN (${perfis.map(() => '?').join(',')})`);
-    params.push(...perfis);
-    if (eu.perfil !== 'admin') {
-      filtros.push("(perfil = 'cliente' OR loja_id = ?)");
-      params.push(eu.loja_id);
-    } else if (req.query.loja_id) {
-      filtros.push('loja_id = ?');
-      params.push(Number(req.query.loja_id));
-    }
-    if (req.query.busca) {
-      const termo = `%${String(req.query.busca).trim()}%`;
-      filtros.push('(nome LIKE ? OR email LIKE ? OR cpf LIKE ? OR telefone LIKE ?)');
-      params.push(termo, termo, termo.replace(/\D/g, '') ? `%${String(req.query.busca).replace(/\D/g, '')}%` : termo, termo);
-    }
-    const lista = (await db.all(`SELECT * FROM usuarios WHERE ${filtros.join(' AND ')} ORDER BY nome LIMIT 200`, ...params))
-      .map(usuarioPublico);
-    res.json(lista);
-  });
-
-  app.post('/api/usuarios', exigir('usuarios.gerenciar', 'clientes.cadastrar'), async (req, res) => {
-    const eu = req.usuario;
-    const perfil = req.body.perfil || 'cliente';
-    if (!PERFIS[perfil]) falha(400, 'Perfil inválido.');
-    if (!PODE_GERENCIAR[eu.perfil].includes(perfil)) falha(403, 'Você não pode cadastrar usuários com este perfil.');
-    const dados = validarDadosUsuario(req.body, { novo: true });
-    if ((await db.get('SELECT 1 FROM usuarios WHERE email = ?', dados.email))) falha(409, 'Já existe um usuário com este e-mail.');
-    const lojaId = await resolverLojaDoUsuario(eu, perfil, req.body.loja_id);
-    const id = (await db.run(`INSERT INTO usuarios (nome, email, senha_hash, telefone, cpf, data_nascimento, perfil, loja_id, registro_profissional)
-         VALUES (?,?,?,?,?,?,?,?,?)`, dados.nome,
-        dados.email,
-        bcrypt.hashSync(dados.senha, 10),
-        dados.telefone,
-        dados.cpf,
-        dados.data_nascimento,
-        perfil,
-        lojaId,
-        perfil === 'optometrista' ? req.body.registro_profissional || null : null)).lastInsertRowid;
-    await auditar(eu.id, 'criar', 'usuario', id, { perfil, loja_id: lojaId });
-    res.status(201).json(usuarioPublico((await db.get('SELECT * FROM usuarios WHERE id = ?', id))));
-  });
-
-  app.put('/api/usuarios/:id', exigir('usuarios.gerenciar', 'clientes.cadastrar'), async (req, res) => {
-    const eu = req.usuario;
-    const alvo = (await db.get('SELECT * FROM usuarios WHERE id = ?', Number(req.params.id)));
-    if (!alvo || !noEscopo(eu, alvo)) falha(404, 'Usuário não encontrado.');
-    if (alvo.id === eu.id) falha(400, 'Use "Meu perfil" para alterar seus próprios dados.');
-    const perfil = req.body.perfil || alvo.perfil;
-    if (!PODE_GERENCIAR[eu.perfil].includes(perfil)) falha(403, 'Você não pode atribuir este perfil.');
-    const dados = validarDadosUsuario({ ...alvo, ...req.body }, { novo: false });
-    const outro = (await db.get('SELECT id FROM usuarios WHERE email = ? AND id <> ?', dados.email, alvo.id));
-    if (outro) falha(409, 'Já existe um usuário com este e-mail.');
-    const lojaId = await resolverLojaDoUsuario(eu, perfil, req.body.loja_id ?? alvo.loja_id);
-    const ativo = req.body.ativo === undefined ? alvo.ativo : req.body.ativo ? 1 : 0;
-    (await db.run(`UPDATE usuarios SET nome=?, email=?, telefone=?, cpf=?, data_nascimento=?, perfil=?, loja_id=?, registro_profissional=?, ativo=?,
-       senha_hash=? WHERE id=?`, dados.nome,
-      dados.email,
-      dados.telefone,
-      dados.cpf,
-      dados.data_nascimento,
-      perfil,
-      lojaId,
-      perfil === 'optometrista' ? req.body.registro_profissional ?? alvo.registro_profissional : null,
-      ativo,
-      req.body.senha ? bcrypt.hashSync(dados.senha, 10) : alvo.senha_hash,
-      alvo.id));
-    if (!ativo) (await db.run('DELETE FROM sessoes WHERE usuario_id = ?', alvo.id));
-    const { senha, ...semSenha } = req.body;
-    await auditar(eu.id, 'editar', 'usuario', alvo.id, { ...semSenha, senha_alterada: !!senha });
-    res.json(usuarioPublico((await db.get('SELECT * FROM usuarios WHERE id = ?', alvo.id))));
-  });
-
-  // Optometristas visíveis para agendamento (nome apenas)
-  app.get('/api/optometristas', exigirLogin, async (req, res) => {
-    const lojaId = req.query.loja_id ? Number(req.query.loja_id) : null;
-    const sql = lojaId
-      ? `SELECT DISTINCT u.id, u.nome, u.loja_id FROM usuarios u JOIN disponibilidades d ON d.optometrista_id = u.id
-         WHERE u.perfil='optometrista' AND u.ativo=1 AND (d.loja_id = ? OR u.loja_id = ?) ORDER BY u.nome`
-      : `SELECT id, nome, loja_id FROM usuarios WHERE perfil='optometrista' AND ativo=1 ORDER BY nome`;
-    res.json(lojaId ? (await db.all(sql, lojaId, lojaId)) : (await db.all(sql)));
-  });
-
-  // ---------- Disponibilidade e bloqueios ----------
-  const optometristaNoEscopo = async (eu, optId) => {
-    const o = (await db.get("SELECT * FROM usuarios WHERE id = ? AND perfil = 'optometrista'", optId));
-    if (!o) return null;
-    if (eu.perfil === 'admin') return o;
-    if (eu.perfil === 'optometrista') return o.id === eu.id ? o : null;
-    if (eu.perfil === 'gerente') {
-      const atendeNaLoja = (await db.get('SELECT 1 FROM disponibilidades WHERE optometrista_id = ? AND loja_id = ?', o.id, eu.loja_id));
-      return o.loja_id === eu.loja_id || atendeNaLoja ? o : null;
-    }
-    return null;
+  const validarLoja = (b, atual = {}) => {
+    const nome = String(b.nome ?? atual.nome ?? '').trim();
+    if (!nome) falha(400, 'Informe o nome da unidade.');
+    const dur = Number(b.duracao_consulta ?? atual.duracao_consulta ?? 30);
+    if (!Number.isInteger(dur) || dur < 5 || dur > 240) falha(400, 'A duração do atendimento deve ficar entre 5 e 240 minutos.');
+    const vagas = Number(b.vagas_por_horario ?? atual.vagas_por_horario ?? 1);
+    if (!Number.isInteger(vagas) || vagas < 1 || vagas > 50) falha(400, 'Vagas por horário deve ficar entre 1 e 50.');
+    const abre = b.hora_abertura ?? atual.hora_abertura ?? '09:00';
+    const fecha = b.hora_fechamento ?? atual.hora_fechamento ?? '18:00';
+    if (!agenda.horaValida(abre) || !agenda.horaValida(fecha) || abre >= fecha) falha(400, 'Horário de funcionamento inválido.');
+    return {
+      nome,
+      endereco: b.endereco ?? atual.endereco ?? null,
+      cidade: b.cidade ?? atual.cidade ?? null,
+      telefone: b.telefone ?? atual.telefone ?? null,
+      hora_abertura: abre,
+      hora_fechamento: fecha,
+      duracao_consulta: dur,
+      vagas_por_horario: vagas,
+      ativa: b.ativa === undefined ? (atual.ativa ?? 1) !== 0 : !!b.ativa,
+    };
   };
 
-  app.get('/api/disponibilidades', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
-    const eu = req.usuario;
-    const f = [];
-    const p = [];
-    if (eu.perfil === 'gerente') {
-      f.push('d.loja_id = ?');
-      p.push(eu.loja_id);
-    } else if (eu.perfil === 'optometrista') {
-      f.push('d.optometrista_id = ?');
-      p.push(eu.id);
-    }
-    if (req.query.loja_id) {
-      f.push('d.loja_id = ?');
-      p.push(Number(req.query.loja_id));
-    }
-    if (req.query.optometrista_id) {
-      f.push('d.optometrista_id = ?');
-      p.push(Number(req.query.optometrista_id));
-    }
-    res.json(
-      (await db.all(`SELECT d.*, u.nome AS optometrista_nome, l.nome AS loja_nome FROM disponibilidades d
-           JOIN usuarios u ON u.id = d.optometrista_id JOIN lojas l ON l.id = d.loja_id
-           ${f.length ? 'WHERE ' + f.join(' AND ') : ''} ORDER BY u.nome, d.dia_semana, d.hora_inicio`, ...p))
+  const validarEmail = (email) => {
+    const e = String(email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) falha(400, 'Informe um e-mail válido.');
+    return e;
+  };
+  const validarSenha = (senha) => {
+    if (!senha || String(senha).length < 8) falha(400, 'A senha deve ter ao menos 8 caracteres.');
+    return String(senha);
+  };
+
+  // Criar uma unidade exige o e-mail e a senha de acesso dela
+  app.post('/api/lojas', exigir('unidades'), async (req, res) => {
+    const loja = validarLoja(req.body);
+    const email = validarEmail(req.body.acesso_email);
+    const senha = validarSenha(req.body.acesso_senha);
+    if (await db.get('SELECT 1 FROM usuarios WHERE email = ?', email)) falha(409, 'Já existe um usuário com o e-mail de acesso informado.');
+    const { lojaId } = await db.transacao((tx) =>
+      criarUnidade(tx, loja, { email, senha, nome: req.body.acesso_nome, pode_agendar: !!req.body.acesso_pode_agendar })
     );
+    await auditar(req.usuario.id, 'criar', 'unidade', lojaId, { ...loja, acesso_email: email });
+    res.status(201).json(await db.get('SELECT * FROM lojas WHERE id = ?', lojaId));
   });
 
-  app.post('/api/disponibilidades', exigir('agenda.configurar'), async (req, res) => {
-    const eu = req.usuario;
-    const { optometrista_id, dia_semana, hora_inicio, hora_fim } = req.body;
-    const lojaId = eu.perfil === 'admin' ? Number(req.body.loja_id) : eu.loja_id;
-    if (!(await db.get('SELECT 1 FROM lojas WHERE id = ?', lojaId))) falha(400, 'Loja inválida.');
-    const o = (await db.get("SELECT * FROM usuarios WHERE id = ? AND perfil = 'optometrista' AND ativo = 1", Number(optometrista_id)));
-    if (!o) falha(400, 'Optometrista inválido.');
-    const dia = Number(dia_semana);
-    if (!Number.isInteger(dia) || dia < 0 || dia > 6) falha(400, 'Dia da semana inválido.');
-    if (!agenda.horaValida(hora_inicio) || !agenda.horaValida(hora_fim) || hora_inicio >= hora_fim) falha(400, 'Horário inválido.');
-    const conflito = (await db.get('SELECT 1 FROM disponibilidades WHERE optometrista_id = ? AND dia_semana = ? AND hora_inicio < ? AND ? < hora_fim', o.id, dia, hora_fim, hora_inicio));
-    if (conflito) falha(409, 'Este optometrista já tem horário cadastrado nesse intervalo.');
-    const id = (await db.run('INSERT INTO disponibilidades (optometrista_id, loja_id, dia_semana, hora_inicio, hora_fim) VALUES (?,?,?,?,?)', o.id, lojaId, dia, hora_inicio, hora_fim)).lastInsertRowid;
-    await auditar(eu.id, 'criar', 'disponibilidade', id, req.body);
-    res.status(201).json((await db.get('SELECT * FROM disponibilidades WHERE id = ?', id)));
+  app.put('/api/lojas/:id', exigir('unidades'), async (req, res) => {
+    const atual = await db.get('SELECT * FROM lojas WHERE id = ?', Number(req.params.id));
+    if (!atual) falha(404, 'Unidade não encontrada.');
+    const l = validarLoja(req.body, atual);
+    await db.run(
+      'UPDATE lojas SET nome=?, endereco=?, cidade=?, telefone=?, hora_abertura=?, hora_fechamento=?, duracao_consulta=?, vagas_por_horario=?, ativa=? WHERE id=?',
+      l.nome, l.endereco, l.cidade, l.telefone, l.hora_abertura, l.hora_fechamento, l.duracao_consulta, l.vagas_por_horario, l.ativa ? 1 : 0, atual.id
+    );
+    await auditar(req.usuario.id, 'editar', 'unidade', atual.id, req.body);
+    res.json(await db.get('SELECT * FROM lojas WHERE id = ?', atual.id));
   });
 
-  app.delete('/api/disponibilidades/:id', exigir('agenda.configurar'), async (req, res) => {
-    const d = (await db.get('SELECT * FROM disponibilidades WHERE id = ?', Number(req.params.id)));
-    if (!d || (req.usuario.perfil !== 'admin' && d.loja_id !== req.usuario.loja_id)) falha(404, 'Horário não encontrado.');
-    (await db.run('DELETE FROM disponibilidades WHERE id = ?', d.id));
-    await auditar(req.usuario.id, 'excluir', 'disponibilidade', d.id, d);
+  // Horários de atendimento da unidade (substitui a lista inteira)
+  app.get('/api/lojas/:id/horarios', exigir('horarios'), async (req, res) => {
+    garantirLoja(req.usuario, req.params.id);
+    const loja = await db.get('SELECT * FROM lojas WHERE id = ?', Number(req.params.id));
+    if (!loja) falha(404, 'Unidade não encontrada.');
+    const horarios = await db.all('SELECT dia_semana, hora_inicio, hora_fim FROM horarios_loja WHERE loja_id = ? ORDER BY dia_semana, hora_inicio', loja.id);
+    res.json({ loja, horarios });
+  });
+
+  app.put('/api/lojas/:id/horarios', exigir('horarios'), async (req, res) => {
+    garantirLoja(req.usuario, req.params.id);
+    const loja = await db.get('SELECT * FROM lojas WHERE id = ?', Number(req.params.id));
+    if (!loja) falha(404, 'Unidade não encontrada.');
+    const horarios = Array.isArray(req.body.horarios) ? req.body.horarios : falha(400, 'Envie a lista de horários.');
+    for (const h of horarios) {
+      const d = Number(h.dia_semana);
+      if (!Number.isInteger(d) || d < 0 || d > 6) falha(400, 'Dia da semana inválido.');
+      if (!agenda.horaValida(h.hora_inicio) || !agenda.horaValida(h.hora_fim) || h.hora_inicio >= h.hora_fim)
+        falha(400, `Horário inválido na ${['domingo', 'segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado'][d]}.`);
+    }
+    const l = validarLoja({ duracao_consulta: req.body.duracao_consulta, vagas_por_horario: req.body.vagas_por_horario }, loja);
+    await db.transacao(async (tx) => {
+      await tx.run('DELETE FROM horarios_loja WHERE loja_id = ?', loja.id);
+      for (const h of horarios)
+        await tx.run('INSERT INTO horarios_loja (loja_id, dia_semana, hora_inicio, hora_fim) VALUES (?,?,?,?)', loja.id, Number(h.dia_semana), h.hora_inicio, h.hora_fim);
+      await tx.run('UPDATE lojas SET duracao_consulta = ?, vagas_por_horario = ? WHERE id = ?', l.duracao_consulta, l.vagas_por_horario, loja.id);
+    });
+    await auditar(req.usuario.id, 'editar_horarios', 'unidade', loja.id, req.body);
     res.json({ ok: true });
   });
 
-  app.get('/api/bloqueios', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
-    const eu = req.usuario;
-    let lista = (await db.all(`SELECT b.*, u.nome AS optometrista_nome FROM bloqueios b JOIN usuarios u ON u.id = b.optometrista_id
-         WHERE b.data >= ? ORDER BY b.data, b.hora_inicio`, agenda.hojeISO(agora())));
-    const visiveis = await Promise.all(lista.map((b) => optometristaNoEscopo(eu, b.optometrista_id)));
-    lista = lista.filter((_, i) => visiveis[i]);
-    res.json(lista);
+  app.get('/api/bloqueios', exigir('horarios'), async (req, res) => {
+    const lojaId = lojaDoEscopo(req.usuario, req.query.loja_id);
+    res.json(
+      await db.all(
+        `SELECT b.*, l.nome AS loja_nome FROM bloqueios_loja b JOIN lojas l ON l.id = b.loja_id
+         WHERE b.data >= ? ${lojaId ? 'AND b.loja_id = ?' : ''} ORDER BY b.data, b.hora_inicio`,
+        ...[agenda.hojeISO(agora()), lojaId].filter((v) => v !== null)
+      )
+    );
   });
 
-  app.post('/api/bloqueios', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
-    const eu = req.usuario;
-    const optId = eu.perfil === 'optometrista' ? eu.id : Number(req.body.optometrista_id);
-    if (!await optometristaNoEscopo(eu, optId)) falha(400, 'Optometrista inválido.');
+  app.post('/api/bloqueios', exigir('horarios'), async (req, res) => {
+    const lojaId = ehAdmin(req.usuario) ? Number(req.body.loja_id) : req.usuario.loja_id;
+    if (!(await db.get('SELECT 1 FROM lojas WHERE id = ?', lojaId))) falha(400, 'Escolha a unidade.');
     const { data } = req.body;
     const hi = req.body.hora_inicio || '00:00';
     const hf = req.body.hora_fim || '23:59';
     if (!agenda.dataValida(data)) falha(400, 'Data inválida.');
     if (!agenda.horaValida(hi) || !agenda.horaValida(hf) || hi >= hf) falha(400, 'Horário inválido.');
-    const id = (await db.run('INSERT INTO bloqueios (optometrista_id, data, hora_inicio, hora_fim, motivo) VALUES (?,?,?,?,?)', optId, data, hi, hf, req.body.motivo || null)).lastInsertRowid;
-    await auditar(eu.id, 'criar', 'bloqueio', id, req.body);
-    // Avisa quais consultas já marcadas caem no bloqueio, para a loja remarcar
-    const afetados = (await db.all(`SELECT a.id, a.hora, c.nome AS cliente_nome FROM agendamentos a JOIN usuarios c ON c.id = a.cliente_id
-         WHERE a.optometrista_id = ? AND a.data = ? AND a.status IN ('agendado','confirmado') AND a.hora < ? AND a.hora >= ?`, optId, data, hf, hi));
+    const id = (
+      await db.run('INSERT INTO bloqueios_loja (loja_id, data, hora_inicio, hora_fim, motivo) VALUES (?,?,?,?,?)', lojaId, data, hi, hf, req.body.motivo || null)
+    ).lastInsertRowid;
+    await auditar(req.usuario.id, 'criar', 'bloqueio', id, req.body);
+    const afetados = await db.all(
+      `SELECT a.id, a.hora, c.nome AS cliente_nome FROM agendamentos a JOIN clientes c ON c.id = a.cliente_id
+       WHERE a.loja_id = ? AND a.data = ? AND a.status IN ('agendado','confirmado') AND a.hora >= ? AND a.hora < ?`,
+      lojaId, data, hi, hf
+    );
     res.status(201).json({ id, agendamentos_afetados: afetados });
   });
 
-  app.delete('/api/bloqueios/:id', exigir('agenda.configurar', 'agenda.bloquear_propria'), async (req, res) => {
-    const b = (await db.get('SELECT * FROM bloqueios WHERE id = ?', Number(req.params.id)));
-    if (!b || !await optometristaNoEscopo(req.usuario, b.optometrista_id)) falha(404, 'Bloqueio não encontrado.');
-    (await db.run('DELETE FROM bloqueios WHERE id = ?', b.id));
+  app.delete('/api/bloqueios/:id', exigir('horarios'), async (req, res) => {
+    const b = await db.get('SELECT * FROM bloqueios_loja WHERE id = ?', Number(req.params.id));
+    if (!b || (!ehAdmin(req.usuario) && b.loja_id !== req.usuario.loja_id)) falha(404, 'Bloqueio não encontrado.');
+    await db.run('DELETE FROM bloqueios_loja WHERE id = ?', b.id);
     await auditar(req.usuario.id, 'excluir', 'bloqueio', b.id, b);
     res.json({ ok: true });
   });
 
-  // ---------- Horários livres ----------
-  app.get('/api/horarios', exigirLogin, async (req, res) => {
-    const { loja_id, data, optometrista_id } = req.query;
-    if (!agenda.dataValida(data)) falha(400, 'Data inválida.');
+  // ---------- Usuários ----------
+  // Usuário alvo está no escopo de quem o gerencia?
+  const noEscopo = (eu, alvo) =>
+    perfisGerenciaveis(eu).includes(alvo.perfil) && (ehAdmin(eu) || alvo.loja_id === eu.loja_id);
+
+  app.get('/api/usuarios', exigir('usuarios'), async (req, res) => {
+    const eu = req.usuario;
+    const f = [];
+    const p = [];
+    if (!ehAdmin(eu)) {
+      f.push('loja_id = ?');
+      p.push(eu.loja_id);
+    } else if (req.query.loja_id) {
+      f.push('loja_id = ?');
+      p.push(Number(req.query.loja_id));
+    }
+    if (req.query.perfil) {
+      f.push('perfil = ?');
+      p.push(req.query.perfil);
+    }
+    if (req.query.busca) {
+      f.push('(nome LIKE ? OR email LIKE ?)');
+      p.push(`%${req.query.busca}%`, `%${req.query.busca}%`);
+    }
+    const lista = await db.all(
+      `SELECT * FROM usuarios ${f.length ? 'WHERE ' + f.join(' AND ') : ''} ORDER BY perfil = 'admin' DESC, nome LIMIT 500`,
+      ...p
+    );
+    res.json(lista.map((u) => ({ ...usuarioPublico(u), editavel: u.id !== eu.id && noEscopo(eu, u) })));
+  });
+
+  const resolverLoja = async (eu, perfil, lojaId) => {
+    if (perfil === 'admin') return null;
+    const id = ehAdmin(eu) ? Number(lojaId) : eu.loja_id;
+    if (!id || !(await db.get('SELECT 1 FROM lojas WHERE id = ?', id))) falha(400, 'Escolha a unidade deste usuário.');
+    return id;
+  };
+
+  app.post('/api/usuarios', exigir('usuarios'), async (req, res) => {
+    const eu = req.usuario;
+    const perfil = req.body.perfil || 'atendente';
+    if (!perfisGerenciaveis(eu).includes(perfil)) falha(403, 'Você não pode cadastrar usuários com este perfil.');
+    const nome = String(req.body.nome || '').trim() || falha(400, 'Informe o nome.');
+    const email = validarEmail(req.body.email);
+    const senha = validarSenha(req.body.senha);
+    if (await db.get('SELECT 1 FROM usuarios WHERE email = ?', email)) falha(409, 'Já existe um usuário com este e-mail.');
+    const lojaId = await resolverLoja(eu, perfil, req.body.loja_id);
+    const pode = ehAdmin(eu) ? !!req.body.pode_agendar : false;
+    const id = (
+      await db.run(
+        'INSERT INTO usuarios (nome, email, senha_hash, telefone, perfil, loja_id, pode_agendar) VALUES (?,?,?,?,?,?,?)',
+        nome, email, bcrypt.hashSync(senha, 10), req.body.telefone || null, perfil, lojaId, pode ? 1 : 0
+      )
+    ).lastInsertRowid;
+    await auditar(eu.id, 'criar', 'usuario', id, { perfil, loja_id: lojaId, pode_agendar: pode });
+    res.status(201).json(usuarioPublico(await db.get('SELECT * FROM usuarios WHERE id = ?', id)));
+  });
+
+  app.put('/api/usuarios/:id', exigir('usuarios'), async (req, res) => {
+    const eu = req.usuario;
+    const alvo = await db.get('SELECT * FROM usuarios WHERE id = ?', Number(req.params.id));
+    if (!alvo || !noEscopo(eu, alvo)) falha(404, 'Usuário não encontrado.');
+    if (alvo.id === eu.id) falha(400, 'Use "Meu perfil" para alterar seus próprios dados.');
+    const perfil = req.body.perfil || alvo.perfil;
+    if (!perfisGerenciaveis(eu).includes(perfil)) falha(403, 'Você não pode atribuir este perfil.');
+    const nome = String(req.body.nome ?? alvo.nome).trim() || falha(400, 'Informe o nome.');
+    const email = validarEmail(req.body.email ?? alvo.email);
+    if (await db.get('SELECT 1 FROM usuarios WHERE email = ? AND id <> ?', email, alvo.id)) falha(409, 'Já existe um usuário com este e-mail.');
+    const lojaId = await resolverLoja(eu, perfil, req.body.loja_id ?? alvo.loja_id);
+    const ativo = req.body.ativo === undefined ? alvo.ativo : req.body.ativo ? 1 : 0;
+    const pode = ehAdmin(eu) && req.body.pode_agendar !== undefined ? (req.body.pode_agendar ? 1 : 0) : alvo.pode_agendar;
+    const hash = req.body.senha ? bcrypt.hashSync(validarSenha(req.body.senha), 10) : alvo.senha_hash;
+    await db.run(
+      'UPDATE usuarios SET nome=?, email=?, telefone=?, perfil=?, loja_id=?, pode_agendar=?, ativo=?, senha_hash=? WHERE id=?',
+      nome, email, req.body.telefone ?? alvo.telefone, perfil, lojaId, pode, ativo, hash, alvo.id
+    );
+    if (!ativo || req.body.senha) await db.run('DELETE FROM sessoes WHERE usuario_id = ?', alvo.id);
+    const { senha, ...semSenha } = req.body;
+    await auditar(eu.id, 'editar', 'usuario', alvo.id, { ...semSenha, senha_alterada: !!senha });
+    res.json(usuarioPublico(await db.get('SELECT * FROM usuarios WHERE id = ?', alvo.id)));
+  });
+
+  // ---------- Clientes ----------
+  const exigirAgendar = [exigirLogin, (req, res, next) => (podeAgendar(req.usuario) ? next() : res.status(403).json({ erro: 'O administrador ainda não liberou a criação de agendamentos para você.' }))];
+
+  app.get('/api/clientes', exigirAgendar, async (req, res) => {
+    const termo = String(req.query.busca || '').trim();
+    if (termo.length < 2) return res.json([]);
+    const digitos = termo.replace(/\D/g, '');
+    const porNumero = "OR replace(replace(replace(replace(telefone, '(', ''), ')', ''), ' ', ''), '-', '') LIKE ? OR cpf LIKE ?";
     res.json(
-      await agenda.horariosLivres(db, {
-        lojaId: Number(loja_id),
-        data,
-        optometristaId: optometrista_id ? Number(optometrista_id) : null,
-        agora: agora(),
-      })
+      await db.all(
+        `SELECT * FROM clientes WHERE nome LIKE ? OR email LIKE ? ${digitos.length >= 4 ? porNumero : ''}
+         ORDER BY nome LIMIT 30`,
+        ...[`%${termo}%`, `%${termo}%`, ...(digitos.length >= 4 ? [`%${digitos}%`, `%${digitos}%`] : [])]
+      )
     );
   });
 
-  // ---------- Agendamentos ----------
-  const SELECT_AG = `SELECT a.*, l.nome AS loja_nome, l.endereco AS loja_endereco, c.nome AS cliente_nome, c.telefone AS cliente_telefone,
-      c.email AS cliente_email, o.nome AS optometrista_nome,
-      EXISTS(SELECT 1 FROM exames e WHERE e.agendamento_id = a.id) AS tem_exame
-    FROM agendamentos a JOIN lojas l ON l.id = a.loja_id JOIN usuarios c ON c.id = a.cliente_id JOIN usuarios o ON o.id = a.optometrista_id`;
-
-  function escopoAgendamentos(eu) {
-    switch (eu.perfil) {
-      case 'admin':
-        return ['1=1', []];
-      case 'gerente':
-      case 'atendente':
-        return ['a.loja_id = ?', [eu.loja_id]];
-      case 'optometrista':
-        return ['a.optometrista_id = ?', [eu.id]];
-      default:
-        return ['a.cliente_id = ?', [eu.id]];
+  async function obterCliente(dbx, dados) {
+    if (dados.crm_id) {
+      const c = await dbx.get('SELECT * FROM clientes WHERE crm_id = ?', String(dados.crm_id));
+      if (c) return c.id;
     }
+    const digitos = String(dados.telefone || '').replace(/\D/g, '');
+    if (digitos.length >= 8) {
+      const final = digitos.slice(-8);
+      const candidatos = await dbx.all('SELECT * FROM clientes WHERE telefone IS NOT NULL');
+      const achado = candidatos.find((c) => String(c.telefone).replace(/\D/g, '').endsWith(final));
+      if (achado) {
+        if (dados.crm_id && !achado.crm_id) await dbx.run('UPDATE clientes SET crm_id = ? WHERE id = ?', String(dados.crm_id), achado.id);
+        return achado.id;
+      }
+    }
+    const nome = String(dados.nome || '').trim();
+    if (!nome) falha(400, 'Informe o nome do cliente.');
+    return (
+      await dbx.run(
+        'INSERT INTO clientes (nome, telefone, email, cpf, crm_id) VALUES (?,?,?,?,?)',
+        nome, dados.telefone || null, dados.email || null, dados.cpf ? String(dados.cpf).replace(/\D/g, '') : null, dados.crm_id ? String(dados.crm_id) : null
+      )
+    ).lastInsertRowid;
   }
 
+  // ---------- Horários livres ----------
+  app.get('/api/horarios', exigirLogin, async (req, res) => {
+    const { loja_id, data } = req.query;
+    garantirLoja(req.usuario, loja_id);
+    if (!agenda.dataValida(data)) falha(400, 'Data inválida.');
+    res.json(await agenda.horariosLivres(db, { lojaId: Number(loja_id), data, agora: agora() }));
+  });
+
+  // ---------- Agendamentos ----------
+  const SELECT_AG = `SELECT a.*, l.nome AS loja_nome, c.nome AS cliente_nome, c.telefone AS cliente_telefone,
+      c.email AS cliente_email, c.crm_id AS cliente_crm_id, u.nome AS criado_por_nome
+    FROM agendamentos a JOIN lojas l ON l.id = a.loja_id JOIN clientes c ON c.id = a.cliente_id
+    LEFT JOIN usuarios u ON u.id = a.criado_por`;
+
+  const escopo = (eu) => (ehAdmin(eu) ? ['1=1', []] : ['a.loja_id = ?', [eu.loja_id]]);
+
   async function buscarAgendamento(eu, id) {
-    const [cond, p] = escopoAgendamentos(eu);
-    const ag = (await db.get(`${SELECT_AG} WHERE a.id = ? AND ${cond}`, Number(id), ...p));
+    const [cond, p] = escopo(eu);
+    const ag = await db.get(`${SELECT_AG} WHERE a.id = ? AND ${cond}`, Number(id), ...p);
     if (!ag) falha(404, 'Agendamento não encontrado.');
     return ag;
   }
 
-  app.get('/api/agendamentos', exigirLogin, async (req, res) => {
-    const eu = req.usuario;
-    const [cond, p] = escopoAgendamentos(eu);
+  async function notificarCrm(evento, ag) {
+    const url = await configuracao(db, 'saida_url');
+    if (!url) return;
+    await integracao.enviarEvento(db, evento, ag, { url, token: await configuracao(db, 'saida_token'), fetchImpl });
+  }
+
+  function filtrosAgendamento(eu, q) {
+    const [cond, p] = escopo(eu);
     const f = [cond];
     const params = [...p];
-    const q = req.query;
     if (q.data_inicio) f.push('a.data >= ?') && params.push(q.data_inicio);
     if (q.data_fim) f.push('a.data <= ?') && params.push(q.data_fim);
-    if (q.loja_id) f.push('a.loja_id = ?') && params.push(Number(q.loja_id));
-    if (q.optometrista_id) f.push('a.optometrista_id = ?') && params.push(Number(q.optometrista_id));
-    if (q.cliente_id && eu.perfil !== 'cliente') f.push('a.cliente_id = ?') && params.push(Number(q.cliente_id));
+    if (q.loja_id && ehAdmin(eu)) f.push('a.loja_id = ?') && params.push(Number(q.loja_id));
+    if (q.origem) f.push('a.origem = ?') && params.push(q.origem);
     if (q.status) {
-      const sts = String(q.status).split(',');
-      f.push(`a.status IN (${sts.map(() => '?').join(',')})`);
-      params.push(...sts);
+      const sts = String(q.status).split(',').filter((s) => STATUS.includes(s));
+      if (sts.length) {
+        f.push(`a.status IN (${sts.map(() => '?').join(',')})`);
+        params.push(...sts);
+      }
     }
-    const ordem = q.ordem === 'desc' ? 'DESC' : 'ASC';
-    res.json((await db.all(`${SELECT_AG} WHERE ${f.join(' AND ')} ORDER BY a.data ${ordem}, a.hora ${ordem} LIMIT 500`, ...params)));
+    if (q.busca) {
+      f.push('(c.nome LIKE ? OR c.telefone LIKE ?)');
+      params.push(`%${q.busca}%`, `%${q.busca}%`);
+    }
+    return [f.join(' AND '), params];
+  }
+
+  app.get('/api/agendamentos', exigirLogin, async (req, res) => {
+    const [where, params] = filtrosAgendamento(req.usuario, req.query);
+    const ordem = req.query.ordem === 'desc' ? 'DESC' : 'ASC';
+    res.json(await db.all(`${SELECT_AG} WHERE ${where} ORDER BY a.data ${ordem}, a.hora ${ordem}, a.id LIMIT 1000`, ...params));
+  });
+
+  // Contagem por dia (calendário) e por unidade (tela de seleção)
+  const SOMAS = `COUNT(*) total, SUM(a.status = 'agendado') agendado, SUM(a.status = 'confirmado') confirmado,
+      SUM(a.status = 'compareceu') compareceu, SUM(a.status = 'faltou') faltou, SUM(a.status = 'cancelado') cancelado`;
+
+  app.get('/api/agendamentos/contagem', exigirLogin, async (req, res) => {
+    const [where, params] = filtrosAgendamento(req.usuario, req.query);
+    const por = req.query.por === 'unidade' ? 'unidade' : 'dia';
+    const sql =
+      por === 'dia'
+        ? `SELECT a.data, ${SOMAS} FROM agendamentos a JOIN clientes c ON c.id = a.cliente_id WHERE ${where} GROUP BY a.data ORDER BY a.data`
+        : `SELECT a.loja_id, ${SOMAS} FROM agendamentos a JOIN clientes c ON c.id = a.cliente_id WHERE ${where} GROUP BY a.loja_id`;
+    res.json(await db.all(sql, ...params));
   });
 
   app.get('/api/agendamentos/:id', exigirLogin, async (req, res) => res.json(await buscarAgendamento(req.usuario, req.params.id)));
 
-  app.post('/api/agendamentos', exigir('agendamentos.criar', 'agendamentos.proprios'), async (req, res) => {
+  app.post('/api/agendamentos', exigirAgendar, async (req, res) => {
     const eu = req.usuario;
-    const lojaId = Number(req.body.loja_id);
+    const lojaId = ehAdmin(eu) ? Number(req.body.loja_id) : eu.loja_id;
+    if (!(await db.get('SELECT 1 FROM lojas WHERE id = ? AND ativa = 1', lojaId))) falha(400, 'Escolha a unidade.');
     const { data, hora } = req.body;
     if (!agenda.dataValida(data) || !agenda.horaValida(hora)) falha(400, 'Escolha data e horário.');
-    if (eu.perfil === 'gerente' || eu.perfil === 'atendente') {
-      if (lojaId !== eu.loja_id) falha(403, 'Você só pode agendar na sua loja.');
-    }
-    const clienteId = eu.perfil === 'cliente' ? eu.id : Number(req.body.cliente_id);
-    const cliente = (await db.get("SELECT * FROM usuarios WHERE id = ? AND perfil = 'cliente' AND ativo = 1", clienteId));
-    if (!cliente) falha(400, 'Selecione o cliente.');
+    const encaixe = !!req.body.encaixe && (ehAdmin(eu) || eu.perfil === 'gerente');
 
-    const id = await db.transacao(async (db) => {
-      const jaTem = (await db.get("SELECT 1 FROM agendamentos WHERE cliente_id = ? AND data = ? AND status IN ('agendado','confirmado','em_atendimento')", clienteId, data));
-      if (jaTem) falha(409, 'Este cliente já tem um exame marcado nesta data.');
-      const slot = (
-        await agenda.horariosLivres(db, {
-          lojaId,
-          data,
-          optometristaId: req.body.optometrista_id ? Number(req.body.optometrista_id) : null,
-          agora: agora(),
-        })
-      ).find((s) => s.hora === hora);
-      if (!slot) falha(409, 'Este horário não está mais disponível. Escolha outro.');
-      const loja = (await db.get('SELECT duracao_consulta FROM lojas WHERE id = ?', lojaId));
-      return (await db.run('INSERT INTO agendamentos (loja_id, cliente_id, optometrista_id, data, hora, duracao, observacoes, criado_por) VALUES (?,?,?,?,?,?,?,?)', lojaId, clienteId, slot.optometristas[0].id, data, hora, loja.duracao_consulta, req.body.observacoes || null, eu.id))
-        .lastInsertRowid;
+    const id = await db.transacao(async (tx) => {
+      const clienteId = req.body.cliente_id
+        ? (await tx.get('SELECT id FROM clientes WHERE id = ?', Number(req.body.cliente_id)))?.id ?? falha(400, 'Cliente não encontrado.')
+        : await obterCliente(tx, req.body.cliente || {});
+      const jaTem = await tx.get(
+        "SELECT 1 FROM agendamentos WHERE cliente_id = ? AND data = ? AND status IN ('agendado','confirmado')",
+        clienteId, data
+      );
+      if (jaTem) falha(409, 'Este cliente já tem um agendamento nesta data.');
+      if (!encaixe) {
+        const livres = await agenda.horariosLivres(tx, { lojaId, data, agora: agora() });
+        if (!livres.some((s) => s.hora === hora)) falha(409, 'Este horário não está disponível. Escolha outro.');
+      }
+      return (
+        await tx.run(
+          'INSERT INTO agendamentos (loja_id, cliente_id, data, hora, observacoes, origem, criado_por) VALUES (?,?,?,?,?,?,?)',
+          lojaId, clienteId, data, hora, req.body.observacoes || null, 'sistema', eu.id
+        )
+      ).lastInsertRowid;
     });
-    await auditar(eu.id, 'criar', 'agendamento', id, { loja_id: lojaId, data, hora, cliente_id: clienteId });
-    res.status(201).json(await buscarAgendamento(eu, id));
+    await auditar(eu.id, 'criar', 'agendamento', id, { loja_id: lojaId, data, hora, encaixe });
+    const ag = await buscarAgendamento(eu, id);
+    await notificarCrm('agendamento.criado', ag);
+    res.status(201).json(ag);
   });
 
   const minutosAte = (ag) => {
@@ -498,128 +532,180 @@ function criarApp(db, { agora = () => new Date() } = {}) {
     return (new Date(a, m - 1, d, hh, mm) - agora()) / 60000;
   };
 
-  // Quem pode levar um agendamento para cada status, e a partir de quais status
+  // Para cada status: de quais status pode vir e quem pode aplicar
   const TRANSICOES = {
-    confirmado: { de: ['agendado'], perfis: ['admin', 'gerente', 'atendente', 'cliente'] },
-    cancelado: { de: ['agendado', 'confirmado'], perfis: ['admin', 'gerente', 'atendente', 'cliente'] },
-    em_atendimento: { de: ['agendado', 'confirmado'], perfis: ['admin', 'gerente', 'optometrista'] },
-    concluido: { de: ['em_atendimento'], perfis: ['admin', 'optometrista'] },
-    faltou: { de: ['agendado', 'confirmado'], perfis: ['admin', 'gerente', 'atendente', 'optometrista'] },
+    confirmado: { de: ['agendado'], pode: () => true },
+    compareceu: { de: ['agendado', 'confirmado', 'faltou'], pode: () => true },
+    faltou: { de: ['agendado', 'confirmado', 'compareceu'], pode: () => true },
+    cancelado: { de: ['agendado', 'confirmado'], pode: podeAgendar },
+    agendado: { de: ['compareceu', 'faltou', 'cancelado'], pode: (u) => ehAdmin(u) || u.perfil === 'gerente' },
   };
 
   app.patch('/api/agendamentos/:id/status', exigirLogin, async (req, res) => {
     const eu = req.usuario;
     const ag = await buscarAgendamento(eu, req.params.id);
     const novo = req.body.status;
-    const regra = TRANSICOES[novo];
-    if (!regra) falha(400, 'Status inválido.');
-    if (!regra.perfis.includes(eu.perfil)) falha(403, 'Seu perfil não pode fazer esta alteração.');
-    if (!regra.de.includes(ag.status)) falha(409, `Não é possível mudar de "${ag.status}" para "${novo}".`);
-    const faltam = minutosAte(ag);
-    if (novo === 'cancelado' && eu.perfil === 'cliente' && faltam < ANTECEDENCIA_CANCELAMENTO_CLIENTE_MIN)
-      falha(409, 'Cancelamentos pelo site precisam de 2 horas de antecedência. Ligue para a loja.');
-    if (novo === 'faltou' && faltam > 0) falha(409, 'Só é possível marcar falta depois do horário da consulta.');
-    if (novo === 'em_atendimento' && ag.data !== agenda.hojeISO(agora())) falha(409, 'O atendimento só pode ser iniciado no dia da consulta.');
-    (await db.run("UPDATE agendamentos SET status = ?, motivo_cancelamento = ?, atualizado_em = datetime('now') WHERE id = ?", novo,
-      novo === 'cancelado' ? req.body.motivo || null : ag.motivo_cancelamento,
-      ag.id));
+    const regra = TRANSICOES[novo] || falha(400, 'Status inválido.');
+    if (!regra.pode(eu)) falha(403, 'Seu usuário não pode fazer esta alteração.');
+    if (!regra.de.includes(ag.status)) falha(409, 'Não é possível fazer esta alteração no status atual.');
+    if (novo === 'compareceu' && ag.data > agenda.hojeISO(agora())) falha(409, 'Só é possível marcar presença no dia do agendamento.');
+    if (novo === 'faltou' && minutosAte(ag) > 0) falha(409, 'Só é possível marcar falta depois do horário agendado.');
+    await db.run(
+      "UPDATE agendamentos SET status = ?, motivo_cancelamento = ?, atualizado_em = datetime('now') WHERE id = ?",
+      novo, novo === 'cancelado' ? req.body.motivo || null : ag.motivo_cancelamento, ag.id
+    );
     await auditar(eu.id, 'status', 'agendamento', ag.id, { de: ag.status, para: novo, motivo: req.body.motivo });
-    res.json(await buscarAgendamento(eu, ag.id));
+    const atualizado = await buscarAgendamento(eu, ag.id);
+    await notificarCrm(`agendamento.${novo}`, atualizado);
+    res.json(atualizado);
   });
 
-  app.put('/api/agendamentos/:id/remarcar', exigir('agendamentos.alterar', 'agendamentos.proprios'), async (req, res) => {
+  app.put('/api/agendamentos/:id/remarcar', exigirAgendar, async (req, res) => {
     const eu = req.usuario;
     const ag = await buscarAgendamento(eu, req.params.id);
-    if (!['agendado', 'confirmado'].includes(ag.status)) falha(409, 'Só consultas agendadas ou confirmadas podem ser remarcadas.');
-    if (eu.perfil === 'cliente' && minutosAte(ag) < ANTECEDENCIA_CANCELAMENTO_CLIENTE_MIN)
-      falha(409, 'Remarcações pelo site precisam de 2 horas de antecedência. Ligue para a loja.');
+    if (!['agendado', 'confirmado'].includes(ag.status)) falha(409, 'Só agendamentos em aberto podem ser remarcados.');
     const { data, hora } = req.body;
     if (!agenda.dataValida(data) || !agenda.horaValida(hora)) falha(400, 'Escolha data e horário.');
-    await db.transacao(async (db) => {
-      const slot = (
-        await agenda.horariosLivres(db, {
-          lojaId: ag.loja_id,
-          data,
-          optometristaId: req.body.optometrista_id ? Number(req.body.optometrista_id) : null,
-          ignorarAgendamentoId: ag.id,
-          agora: agora(),
-        })
-      ).find((s) => s.hora === hora);
-      if (!slot) falha(409, 'Este horário não está disponível. Escolha outro.');
-      const opt = slot.optometristas.find((o) => o.id === ag.optometrista_id) || slot.optometristas[0];
-      (await db.run("UPDATE agendamentos SET data = ?, hora = ?, optometrista_id = ?, status = 'agendado', atualizado_em = datetime('now') WHERE id = ?", data, hora, opt.id, ag.id));
+    const encaixe = !!req.body.encaixe && (ehAdmin(eu) || eu.perfil === 'gerente');
+    await db.transacao(async (tx) => {
+      if (!encaixe) {
+        const livres = await agenda.horariosLivres(tx, { lojaId: ag.loja_id, data, ignorarAgendamentoId: ag.id, agora: agora() });
+        if (!livres.some((s) => s.hora === hora)) falha(409, 'Este horário não está disponível. Escolha outro.');
+      }
+      await tx.run("UPDATE agendamentos SET data = ?, hora = ?, status = 'agendado', atualizado_em = datetime('now') WHERE id = ?", data, hora, ag.id);
     });
     await auditar(eu.id, 'remarcar', 'agendamento', ag.id, { de: `${ag.data} ${ag.hora}`, para: `${data} ${hora}` });
-    res.json(await buscarAgendamento(eu, ag.id));
-  });
-
-  // ---------- Exames (dados clínicos) ----------
-  // Visíveis apenas para optometristas, o próprio cliente e o administrador da rede.
-  const CAMPOS_EXAME = [
-    'od_esferico', 'od_cilindrico', 'od_eixo', 'od_acuidade',
-    'oe_esferico', 'oe_cilindrico', 'oe_eixo', 'oe_acuidade',
-    'adicao', 'dnp', 'observacoes',
-  ];
-
-  app.get('/api/agendamentos/:id/exame', exigir('exames.ver', 'exames.proprios'), async (req, res) => {
-    const ag = await buscarAgendamento(req.usuario, req.params.id);
-    res.json((await db.get('SELECT * FROM exames WHERE agendamento_id = ?', ag.id)) || null);
-  });
-
-  app.put('/api/agendamentos/:id/exame', exigir('exames.registrar'), async (req, res) => {
-    const ag = await buscarAgendamento(req.usuario, req.params.id);
-    if (!['em_atendimento', 'concluido'].includes(ag.status)) falha(409, 'Inicie o atendimento antes de registrar o exame.');
-    const valores = CAMPOS_EXAME.map((c) => (req.body[c] === undefined || req.body[c] === '' ? null : String(req.body[c]).slice(0, 500)));
-    (await db.run(`INSERT INTO exames (agendamento_id, ${CAMPOS_EXAME.join(', ')}) VALUES (?, ${CAMPOS_EXAME.map(() => '?').join(', ')})
-       ON CONFLICT(agendamento_id) DO UPDATE SET ${CAMPOS_EXAME.map((c) => `${c} = excluded.${c}`).join(', ')}, registrado_em = datetime('now')`, ag.id, ...valores));
-    await auditar(req.usuario.id, 'registrar_exame', 'agendamento', ag.id);
-    res.json((await db.get('SELECT * FROM exames WHERE agendamento_id = ?', ag.id)));
-  });
-
-  app.get('/api/clientes/:id/exames', exigir('exames.ver', 'exames.proprios'), async (req, res) => {
-    const eu = req.usuario;
-    const clienteId = Number(req.params.id);
-    if (eu.perfil === 'cliente' && clienteId !== eu.id) falha(404, 'Cliente não encontrado.');
-    if (eu.perfil === 'optometrista' && !(await db.get('SELECT 1 FROM agendamentos WHERE cliente_id = ? AND optometrista_id = ?', clienteId, eu.id)))
-      falha(404, 'Cliente não encontrado.');
-    res.json(
-      (await db.all(`SELECT e.*, a.data, a.hora, l.nome AS loja_nome, o.nome AS optometrista_nome, o.registro_profissional
-           FROM exames e JOIN agendamentos a ON a.id = e.agendamento_id JOIN lojas l ON l.id = a.loja_id
-           JOIN usuarios o ON o.id = a.optometrista_id
-           WHERE a.cliente_id = ? ORDER BY a.data DESC, a.hora DESC`, clienteId))
-    );
+    const atualizado = await buscarAgendamento(eu, ag.id);
+    await notificarCrm('agendamento.remarcado', atualizado);
+    res.json(atualizado);
   });
 
   // ---------- Relatórios ----------
-  app.get('/api/relatorios/resumo', exigir('relatorios.ver'), async (req, res) => {
+  app.get('/api/relatorios/resumo', exigir('relatorios'), async (req, res) => {
     const eu = req.usuario;
     const hoje = agenda.hojeISO(agora());
     const inicio = agenda.dataValida(req.query.inicio) ? req.query.inicio : agenda.somarDias(hoje, -30);
     const fim = agenda.dataValida(req.query.fim) ? req.query.fim : hoje;
-    const lojaId = eu.perfil === 'admin' ? (req.query.loja_id ? Number(req.query.loja_id) : null) : eu.loja_id;
+    const lojaId = lojaDoEscopo(eu, req.query.loja_id);
     const filtro = `a.data BETWEEN ? AND ? ${lojaId ? 'AND a.loja_id = ?' : ''}`;
     const p = lojaId ? [inicio, fim, lojaId] : [inicio, fim];
-    const porStatus = Object.fromEntries(
-      (await db.all(`SELECT status, COUNT(*) n FROM agendamentos a WHERE ${filtro} GROUP BY status`, ...p)).map((r) => [r.status, r.n])
-    );
-    const resumo = (sql) => db.all(sql, ...p);
-    const contagens = `COUNT(*) total,
-        SUM(a.status = 'concluido') concluidos, SUM(a.status = 'faltou') faltas, SUM(a.status = 'cancelado') cancelados`;
     res.json({
       inicio,
       fim,
       loja_id: lojaId,
-      por_status: porStatus,
-      por_loja: await resumo(`SELECT l.id, l.nome, ${contagens} FROM agendamentos a JOIN lojas l ON l.id = a.loja_id WHERE ${filtro} GROUP BY l.id ORDER BY total DESC`),
-      por_optometrista: await resumo(
-        `SELECT o.id, o.nome, ${contagens} FROM agendamentos a JOIN usuarios o ON o.id = a.optometrista_id WHERE ${filtro} GROUP BY o.id ORDER BY total DESC`
+      geral: await db.get(`SELECT ${SOMAS} FROM agendamentos a WHERE ${filtro}`, ...p),
+      por_unidade: await db.all(
+        `SELECT l.id, l.nome, ${SOMAS} FROM agendamentos a JOIN lojas l ON l.id = a.loja_id WHERE ${filtro} GROUP BY l.id ORDER BY total DESC`,
+        ...p
       ),
+      por_origem: await db.all(`SELECT a.origem, ${SOMAS} FROM agendamentos a WHERE ${filtro} GROUP BY a.origem`, ...p),
     });
   });
 
-  app.get('/api/auditoria', exigir('auditoria.ver'), async (req, res) => {
+  // ---------- Integração com o CRM ----------
+  const tokenEntrada = () => configuracao(db, 'entrada_token', novoToken);
+
+  app.get('/api/integracao', exigir('integracao'), async (req, res) => {
+    const origem = `${req.protocol}://${req.get('host')}`;
+    res.json({
+      url_entrada: `${origem}${WEBHOOK}?token=${await tokenEntrada()}`,
+      saida_url: (await configuracao(db, 'saida_url')) || '',
+      saida_token_definido: !!(await configuracao(db, 'saida_token')),
+      eventos: await db.all('SELECT * FROM integracao_eventos ORDER BY id DESC LIMIT 50'),
+    });
+  });
+
+  app.put('/api/integracao', exigir('integracao'), async (req, res) => {
+    const url = String(req.body.saida_url || '').trim();
+    if (url && !/^https:\/\/[^\s]+$/i.test(url)) falha(400, 'A URL de envio deve começar com https://');
+    await definirConfiguracao(db, 'saida_url', url || null);
+    if (req.body.saida_token !== undefined) await definirConfiguracao(db, 'saida_token', String(req.body.saida_token).trim() || null);
+    await auditar(req.usuario.id, 'editar', 'integracao', null, { saida_url: url, token_alterado: req.body.saida_token !== undefined });
+    res.json({ ok: true });
+  });
+
+  app.post('/api/integracao/novo-token', exigir('integracao'), async (req, res) => {
+    await definirConfiguracao(db, 'entrada_token', novoToken());
+    await auditar(req.usuario.id, 'novo_token', 'integracao');
+    res.json({ ok: true });
+  });
+
+  app.post('/api/integracao/testar', exigir('integracao'), async (req, res) => {
+    const url = await configuracao(db, 'saida_url');
+    if (!url) falha(400, 'Configure a URL de envio primeiro.');
+    const exemplo = {
+      id: 0, id_externo: null, origem: 'sistema', status: 'agendado', data: agenda.hojeISO(agora()), hora: '10:00',
+      loja_id: 0, loja_nome: 'Teste', cliente_id: 0, cliente_nome: 'Cliente de teste', cliente_telefone: '(00) 00000-0000',
+    };
+    res.json(await integracao.enviarEvento(db, 'teste', exemplo, { url, token: await configuracao(db, 'saida_token'), fetchImpl }));
+  });
+
+  // Recebe agendamentos feitos no CRM. Autenticado pelo token da URL (ou cabeçalho X-Webhook-Token).
+  app.post(WEBHOOK, express.urlencoded({ extended: true }), async (req, res) => {
+    const token = req.query.token || req.get('x-webhook-token');
+    const esperado = await tokenEntrada();
+    const ok = token && token.length === esperado.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(esperado));
+    if (!ok) return res.status(401).json({ erro: 'Token inválido.' });
+
+    const d = integracao.interpretarEntrada(req.body);
+    const responder = async (status, corpo, sucesso) => {
+      await integracao.registrar(db, 'entrada', d.cancelar ? 'cancelamento' : 'agendamento', sucesso, JSON.stringify({ resposta: corpo, recebido: req.body }));
+      res.status(status).json(corpo);
+    };
+    try {
+      const existente = d.id_externo
+        ? await db.get("SELECT * FROM agendamentos WHERE origem = 'crm' AND id_externo = ?", String(d.id_externo))
+        : null;
+
+      if (d.cancelar) {
+        if (!existente) return responder(404, { erro: 'Agendamento não encontrado para cancelar.' }, false);
+        await db.run("UPDATE agendamentos SET status = 'cancelado', motivo_cancelamento = 'Cancelado no CRM', atualizado_em = datetime('now') WHERE id = ?", existente.id);
+        return responder(200, { ok: true, agendamento_id: existente.id, status: 'cancelado' }, true);
+      }
+
+      if (!d.data || !d.hora) return responder(422, { erro: 'Envie data e hora do agendamento.' }, false);
+      const lojas = await db.all('SELECT id, nome FROM lojas WHERE ativa = 1');
+      const u = d.unidade !== undefined ? String(d.unidade).trim().toLowerCase() : null;
+      const loja = u
+        ? lojas.find((l) => String(l.id) === u) ||
+          lojas.find((l) => l.nome.toLowerCase() === u) ||
+          lojas.find((l) => l.nome.toLowerCase().includes(u))
+        : lojas.length === 1
+          ? lojas[0]
+          : null;
+      if (!loja) return responder(422, { erro: 'Unidade não encontrada. Envie "unidade" com o nome ou o código da unidade.' }, false);
+
+      const id = await db.transacao(async (tx) => {
+        const clienteId = await obterCliente(tx, d.cliente);
+        if (existente) {
+          await tx.run(
+            `UPDATE agendamentos SET loja_id = ?, cliente_id = ?, data = ?, hora = ?, observacoes = COALESCE(?, observacoes),
+             status = CASE WHEN status = 'cancelado' THEN 'agendado' ELSE status END, atualizado_em = datetime('now') WHERE id = ?`,
+            loja.id, clienteId, d.data, d.hora, d.observacoes || null, existente.id
+          );
+          return existente.id;
+        }
+        return (
+          await tx.run(
+            "INSERT INTO agendamentos (loja_id, cliente_id, data, hora, observacoes, origem, id_externo) VALUES (?,?,?,?,?,'crm',?)",
+            loja.id, clienteId, d.data, d.hora, d.observacoes || null, d.id_externo ? String(d.id_externo) : null
+          )
+        ).lastInsertRowid;
+      });
+      await auditar(null, existente ? 'atualizar_crm' : 'criar_crm', 'agendamento', id, { id_externo: d.id_externo });
+      return responder(existente ? 200 : 201, { ok: true, agendamento_id: id, unidade: loja.nome, data: d.data, hora: d.hora }, true);
+    } catch (e) {
+      if (e instanceof ErroHttp) return responder(e.status === 400 ? 422 : e.status, { erro: e.message }, false);
+      throw e;
+    }
+  });
+
+  // ---------- Logs (somente administrador principal) ----------
+  app.get('/api/auditoria', exigir('logs'), async (req, res) => {
     res.json(
-      (await db.all(`SELECT x.*, u.nome AS usuario_nome FROM auditoria x LEFT JOIN usuarios u ON u.id = x.usuario_id ORDER BY x.id DESC LIMIT 300`))
+      await db.all(
+        `SELECT x.*, u.nome AS usuario_nome FROM auditoria x LEFT JOIN usuarios u ON u.id = x.usuario_id ORDER BY x.id DESC LIMIT 500`
+      )
     );
   });
 
