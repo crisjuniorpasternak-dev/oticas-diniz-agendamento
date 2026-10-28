@@ -75,8 +75,8 @@ seguindo o princípio de necessidade da LGPD. Toda ação relevante é registrad
 
 ```
 api/index.js       entrada na Vercel
-src/server.js      inicialização local
-src/app.js         rotas da API e regras de acesso
+src/local.js       inicialização local
+src/rotas.js       rotas da API e regras de acesso
 src/permissoes.js  perfis e permissões
 src/agenda.js      cálculo de horários livres
 src/db.js          esquema do banco e dados de demonstração

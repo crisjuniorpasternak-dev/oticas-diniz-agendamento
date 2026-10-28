@@ -1,6 +1,6 @@
 process.env.TZ = process.env.TZ || 'America/Sao_Paulo';
 const { prepararBanco } = require('./db');
-const { criarApp } = require('./app');
+const { criarApp } = require('./rotas');
 
 prepararBanco().then((db) => {
   const app = criarApp(db);

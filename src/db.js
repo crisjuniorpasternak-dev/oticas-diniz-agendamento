@@ -201,10 +201,17 @@ async function criarAdminInicial(db, email, senha) {
 
 // Abre o banco conforme as variáveis de ambiente e aplica os dados iniciais.
 async function prepararBanco(env = process.env) {
-  const url = env.TURSO_DATABASE_URL || env.DATABASE_URL || `file:${env.DB_FILE || path.join(__dirname, '..', 'dados', 'agendamentos.db')}`;
+  const remoto = env.TURSO_DATABASE_URL || env.DATABASE_URL;
+  const producao = !!env.VERCEL || env.NODE_ENV === 'production';
+  if (env.VERCEL && !remoto) throw new Error('Na Vercel é preciso conectar o banco Turso (TURSO_DATABASE_URL).');
+  const url = remoto || `file:${env.DB_FILE || path.join(__dirname, '..', 'dados', 'agendamentos.db')}`;
   const db = await abrir(url, env.TURSO_AUTH_TOKEN || env.DATABASE_AUTH_TOKEN);
   if (env.ADMIN_EMAIL && env.ADMIN_SENHA) {
     if (await criarAdminInicial(db, env.ADMIN_EMAIL, env.ADMIN_SENHA)) console.log(`Administrador inicial criado: ${env.ADMIN_EMAIL}`);
+  } else if (producao) {
+    // Em produção nunca cria usuários de demonstração com senha conhecida
+    if (!(await db.get("SELECT 1 FROM usuarios WHERE perfil = 'admin'")))
+      console.warn('Nenhum administrador cadastrado: defina ADMIN_EMAIL e ADMIN_SENHA e faça um novo deploy.');
   } else if (env.SEM_DEMO !== '1' && (await popularDemo(db))) {
     console.log('Banco criado com dados de demonstração (senha de todos os usuários: diniz123).');
   }

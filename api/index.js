@@ -1,7 +1,7 @@
 // Entrada da Vercel: todas as rotas /api/* chegam aqui (ver vercel.json).
 process.env.TZ = process.env.TZ || 'America/Sao_Paulo';
 const { prepararBanco } = require('../src/db');
-const { criarApp } = require('../src/app');
+const { criarApp } = require('../src/rotas');
 
 let pronto;
 module.exports = async (req, res) => {

@@ -2,7 +2,7 @@ process.env.TZ = 'America/Sao_Paulo';
 const test = require('node:test');
 const assert = require('node:assert');
 const { abrir, popularDemo } = require('../src/db');
-const { criarApp } = require('../src/app');
+const { criarApp } = require('../src/rotas');
 
 // Relógio fixo: segunda-feira, 02/11/2026, 09:00
 let relogio = new Date(2026, 10, 2, 9, 0);
