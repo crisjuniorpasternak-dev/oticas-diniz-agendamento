@@ -27,6 +27,12 @@ const ICONES = {
   ok: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   vazio: '<rect x="3" y="4.5" width="18" height="16.5" rx="2"/><path d="M3 9.5h18M8 3v3M16 3v3M9.5 14.5l5 3M14.5 14.5l-5 3"/>',
   anterior: '<path d="m15 6-6 6 6 6"/>',
+  falta: '<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/>',
+  busca: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  baixar: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+  crm: '<circle cx="9" cy="8" r="3.5"/><path d="M3 20a6 6 0 0 1 12 0M16 4.5a3.5 3.5 0 0 1 0 7M21 20a6 6 0 0 0-3.5-5.5"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  webhook: '<circle cx="12" cy="6" r="2.5"/><circle cx="6" cy="17" r="2.5"/><circle cx="18" cy="17" r="2.5"/><path d="M10.8 8.2 7.2 14.8M8.5 17h7M13.2 8.2l3.6 6.6"/>',
   proximo: '<path d="m9 6 6 6-6 6"/>',
 };
 const icone = (n) => `<svg class="icone" viewBox="0 0 24 24" aria-hidden="true">${ICONES[n] || ''}</svg>`;
@@ -169,17 +175,30 @@ async function iniciar() {
 function renderizar() {
   const [rota, sub] = rotaAtual();
   const u = estado.usuario;
-  const unidades = ehAdmin() ? [['unidades', 'Unidades', 'Unidades']] : [];
-  const itens = [...menu().slice(0, 1), ...unidades, ...menu().slice(1)];
+  const m = Object.fromEntries(menu().map((x) => [x[0], x]));
+  const secoes = [
+    ['', [m.inicio]],
+    ['Agenda', [m.agendamentos, m.novo, ehAdmin() && ['unidades', 'Unidades', 'Unidades']]],
+    ['Gestão', [m.relatorios, pode('integracao') && ['configuracoes/integracao', 'Integrações', 'CRM', 'webhook'], m.configuracoes]],
+  ].map(([t, l]) => [t, l.filter(Boolean)]);
+  const atual = rota === 'configuracoes' && sub === 'integracao' ? 'configuracoes/integracao' : rota;
   const logo = `<span class="selo-logo">D</span>`;
   $('#app').innerHTML = `
     <div class="casca">
       <aside class="lateral">
         <div class="logo">${logo}<div class="logo-texto"><b>Óticas Diniz</b><small>Agendamentos</small></div></div>
-        <nav class="nav" aria-label="Menu principal">${itens
-          .map(([id, nome, curto]) => `<a href="#/${id}" class="nav-item ${id === rota ? 'ativo' : ''}" title="${nome}">${icone(id)}<span class="longo">${nome}</span><span class="curto">${curto}</span></a>`)
+        <nav class="nav" aria-label="Menu principal">${secoes
+          .filter(([, l]) => l.length)
+          .map(
+            ([titulo, l]) =>
+              (titulo ? `<span class="nav-secao">${titulo}</span>` : '') +
+              l.map(([id, nome, curto, ic]) => `<a href="#/${id}" class="nav-item ${id === atual ? 'ativo' : ''}" title="${nome}">${icone(ic || id)}<span class="longo">${nome}</span><span class="curto">${curto}</span></a>`).join('')
+          )
           .join('')}</nav>
-        <div class="rodape"><a href="#" class="nav-item" data-sair title="Sair">${icone('sair')}<span>Sair</span></a></div>
+        <div class="rodape">
+          <a href="#/perfil" class="cartao-usuario" title="Meu perfil"><span class="avatar">${esc(iniciais(u.nome))}</span><span class="nome"><b>${esc(u.nome)}</b><small>${esc(u.perfil_rotulo)}</small></span></a>
+          <a href="#" class="nav-item sair" data-sair title="Sair">${icone('sair')}<span class="longo">Sair</span><span class="curto">Sair</span></a>
+        </div>
       </aside>
       <div class="conteudo">
         <header class="barra">
@@ -193,6 +212,7 @@ function renderizar() {
               : `<span>${esc(estado.loja?.nome || '')}</span>`
           }</div>
           <div class="espaco"></div>
+          <span class="pilula data-hoje">${icone('agendamentos')} ${diaSemana(hoje())}, ${dataBR(hoje())}</span>
           <a href="#/perfil" class="usuario" title="Meu perfil"><span class="nome"><b>${esc(u.nome)}</b><small>${esc(u.perfil_rotulo)}</small></span><span class="avatar">${esc(iniciais(u.nome))}</span></a>
         </header>
         <main id="tela"><div class="tela-carregando"><div class="esqueleto"></div><div class="esqueleto"></div><div class="esqueleto"></div></div></main>
@@ -292,49 +312,117 @@ TELAS.unidades = async (el) => {
   );
 };
 
-// ---------- Início: hoje + calendário ----------
+// ---------- Início: números, gráfico, saúde e calendário ----------
+const pct = (a, b) => (b ? Math.round((a / b) * 100) + '%' : '—');
+const kpi = (rotulo, valor, sub, ic, tom = '') =>
+  `<div class="kpi ${tom}"><div><span class="kpi-rotulo">${rotulo}</span><b>${valor}</b><small>${sub}</small></div><span class="kpi-icone">${icone(ic)}</span></div>`;
+
+// Barras empilhadas por dia (compareceu / não compareceu / aguardando)
+function grafico(dias, por) {
+  const max = Math.max(1, ...dias.map((d) => (por[d] ? por[d].total - por[d].cancelado : 0)));
+  const passo = Math.max(1, Math.ceil(max / 4));
+  const topo = passo * 4;
+  return `<div class="grafico">
+    <div class="eixo">${[4, 3, 2, 1, 0].map((i) => `<span>${passo * i}</span>`).join('')}</div>
+    <div class="barras">${dias
+      .map((d) => {
+        const c = por[d] || { compareceu: 0, faltou: 0, agendado: 0, confirmado: 0 };
+        const esp = c.agendado + c.confirmado;
+        const h = (n) => `${(n / topo) * 100}%`;
+        return `<div class="coluna" title="${dataBR(d)} · ${c.compareceu} compareceram · ${c.faltou} faltaram · ${esp} aguardando" data-dia="${d}">
+          <div class="pilha"><i class="g-espera" style="height:${h(esp)}"></i><i class="g-falta" style="height:${h(c.faltou)}"></i><i class="g-ok" style="height:${h(c.compareceu)}"></i></div>
+          <span>${d.slice(8)}</span></div>`;
+      })
+      .join('')}</div></div>`;
+}
+
 TELAS.inicio = async (el) => {
-  const st = (TELAS.inicio.st ||= { mes: hoje().slice(0, 7), dia: hoje() });
+  const st = (TELAS.inicio.st ||= { mes: hoje().slice(0, 7), dia: hoje(), aba: '' });
   const tituloUnidade = unidadeAtual() ? nomeLoja(unidadeAtual()) : 'Todas as unidades';
+  const inicio30 = somarDias(hoje(), -29);
   el.innerHTML = `
     <div class="cabeca"><div><h1>${esc(tituloUnidade)}</h1><p class="suave">Hoje é ${diaSemana(hoje()).toLowerCase()}, ${dataBR(hoje())}</p></div>
-      ${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo agendamento</a>` : ''}</div>
-    <div class="metricas" id="hoje">${'<div class="metrica carregando"><b>00</b><span>carregando</span></div>'.repeat(5)}</div>
-    <div class="painel">
-      <div class="cartao">
-        <div class="calendario-topo">
-          <button class="btn sec icone-so" id="mes-ant" aria-label="Mês anterior">${icone('anterior')}</button>
-          <h2 id="mes-nome"></h2>
-          <button class="btn sec icone-so" id="mes-prox" aria-label="Próximo mês">${icone('proximo')}</button>
-        </div>
-        <div class="calendario" id="cal"></div>
+      <div class="acoes"><span class="pilula">${icone('agendamentos')} Últimos 30 dias <span class="suave">${dataBR(inicio30).slice(0, 5)} – ${dataBR(hoje()).slice(0, 5)}</span></span>
+      ${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo agendamento</a>` : ''}</div></div>
+    <div class="kpis" id="kpis">${'<div class="kpi carregando"><div><span class="kpi-rotulo">carregando</span><b>00</b><small>carregando</small></div></div>'.repeat(4)}</div>
+    <div class="grade-inicio">
+      <div class="cartao cartao-grafico">
+        <div class="cartao-topo"><div><span class="kpi-rotulo">Agendamentos por dia</span><b class="grande" id="g-total"></b><small class="suave">${dataBR(inicio30).slice(0, 5)} – ${dataBR(hoje()).slice(0, 5)}</small></div>
+          <div class="legenda"><span><i class="g-ok"></i>Compareceu</span><span><i class="g-falta"></i>Não compareceu</span><span><i class="g-espera"></i>Aguardando</span></div></div>
+        <div id="grafico" class="area-grafico"><div class="esqueleto" style="height:220px"></div></div>
       </div>
-      <div class="cartao">
-        <h2>Próximos dias</h2>
-        <ul class="proximos" id="proximos"></ul>
+      <div class="coluna-lado">
+        <div class="cartao" id="saude"><div class="esqueleto" style="height:150px"></div></div>
+        <div class="cartao"><div class="cartao-topo"><span class="kpi-rotulo">Próximos dias</span></div><ul class="proximos" id="proximos"></ul></div>
       </div>
     </div>
-    <div class="cartao tabela-rolagem" id="dia"></div>`;
+    <div class="cartao">
+      <div class="calendario-topo">
+        <div><span class="kpi-rotulo">Agenda</span><h2 id="mes-nome" style="margin:2px 0 0"></h2></div>
+        <div class="acoes"><button class="btn sec icone-so" id="mes-ant" aria-label="Mês anterior">${icone('anterior')}</button>
+        <button class="btn sec peq" id="mes-hoje">Hoje</button>
+        <button class="btn sec icone-so" id="mes-prox" aria-label="Próximo mês">${icone('proximo')}</button></div>
+      </div>
+      <div class="calendario" id="cal"></div>
+      <div class="legenda" style="margin-top:12px"><span><i class="g-espera"></i>Agendado</span><span><i class="g-info"></i>Confirmado</span><span><i class="g-ok"></i>Compareceu</span><span><i class="g-falta"></i>Não compareceu</span></div>
+    </div>
+    <div class="cartao" id="dia"></div>`;
 
   const f = filtroUnidade();
-  const carregarHoje = async () => {
-    const [c] = await api('GET', `/api/agendamentos/contagem?data_inicio=${hoje()}&data_fim=${hoje()}&${f}`);
-    const x = c || { total: 0, agendado: 0, confirmado: 0, compareceu: 0, faltou: 0, cancelado: 0 };
-    $('#hoje').innerHTML = [
-      ['Agendamentos hoje', x.total - x.cancelado, 'destaque'],
-      ['Aguardando', x.agendado + x.confirmado, 't-espera'],
-      ['Compareceram', x.compareceu, 't-ok'],
-      ['Não compareceram', x.faltou, 't-falta'],
-      ['Cancelados', x.cancelado, 't-neutro'],
-    ]
-      .map(([n, v, cl]) => `<div class="metrica ${cl || ''}"><b>${v}</b><span>${n}</span></div>`)
-      .join('');
+  const carregarResumo = async () => {
+    const dias = Array.from({ length: 30 }, (_, i) => somarDias(inicio30, i));
+    const [cont, porUnidade] = await Promise.all([
+      api('GET', `/api/agendamentos/contagem?data_inicio=${inicio30}&data_fim=${hoje()}&${f}`),
+      !unidadeAtual() && estado.lojas.length > 1 ? api('GET', `/api/agendamentos/contagem?por=unidade&data_inicio=${inicio30}&data_fim=${hoje()}`) : null,
+    ]);
+    const por = Object.fromEntries(cont.map((c) => [c.data, c]));
+    const x = por[hoje()] || { total: 0, agendado: 0, confirmado: 0, compareceu: 0, faltou: 0, cancelado: 0 };
+    const soma = (k) => cont.reduce((s, c) => s + (c[k] || 0), 0);
+    const [ok, falta, canc, tot] = [soma('compareceu'), soma('faltou'), soma('cancelado'), soma('total')];
+    $('#kpis').innerHTML = [
+      kpi('Agendados hoje', x.total - x.cancelado, `${x.agendado + x.confirmado} aguardando`, 'agendamentos', 'destaque'),
+      kpi('Compareceram hoje', x.compareceu, `${pct(x.compareceu, x.total - x.cancelado)} do dia`, 'ok', 't-ok'),
+      kpi('Não compareceram hoje', x.faltou, x.faltou ? 'vale um contato de remarcação' : 'nenhuma falta', 'falta', 't-falta'),
+      kpi('Comparecimento 30 dias', pct(ok, ok + falta), `${ok} de ${ok + falta} com presença registrada`, 'relatorios'),
+    ].join('');
+    $('#g-total').textContent = `${tot - canc} agendamentos`;
+    $('#grafico').innerHTML = grafico(dias, por);
+    $$('#grafico [data-dia]').forEach((c) => (c.onclick = () => escolherDia(c.dataset.dia)));
+
+    // Saúde: por unidade (todas) ou situação da própria unidade
+    const sem = soma('agendado') + soma('confirmado');
+    if (porUnidade) {
+      const faixas = { critico: [], atencao: [], saudavel: [] };
+      for (const l of estado.lojas) {
+        const c = porUnidade.find((p) => p.loja_id === l.id);
+        const base = c ? c.compareceu + c.faltou : 0;
+        const t = base ? c.compareceu / base : null;
+        faixas[t === null ? 'saudavel' : t < 0.6 ? 'critico' : t < 0.8 ? 'atencao' : 'saudavel'].push({ ...l, t });
+      }
+      const n = estado.lojas.length;
+      const linha = (k, nome, desc) =>
+        `<li><i class="ponto p-${k}"></i><div><b>${nome}</b><small>${desc}</small>${faixas[k].length ? `<small class="nomes">${faixas[k].map((l) => esc(l.nome.replace(/^Óticas Diniz\s*/i, ''))).join(', ')}</small>` : ''}</div><b class="qtd">${faixas[k].length}</b></li>`;
+      $('#saude').innerHTML = `<div class="cartao-topo"><div><span class="kpi-rotulo">Saúde das unidades</span><small class="suave" style="display:block">Comparecimento nos últimos 30 dias</small></div></div>
+        <div class="barra-saude">${['critico', 'atencao', 'saudavel'].map((k) => `<i class="p-${k}" style="flex:${faixas[k].length || 0.0001}"></i>`).join('')}</div>
+        <ul class="saude">${linha('critico', 'Crítico', 'abaixo de 60% de comparecimento')}${linha('atencao', 'Atenção', 'entre 60% e 79%')}${linha('saudavel', 'Saudável', '80% ou mais, ou sem faltas registradas')}</ul>
+        <p class="suave" style="margin:8px 0 0;font-size:.8rem">${n} unidade(s) na rede</p>`;
+    } else {
+      const base = Math.max(1, ok + falta + sem);
+      $('#saude').innerHTML = `<div class="cartao-topo"><div><span class="kpi-rotulo">Situação dos atendimentos</span><small class="suave" style="display:block">Últimos 30 dias</small></div></div>
+        <div class="barra-saude"><i class="p-saudavel" style="flex:${ok || 0.0001}"></i><i class="p-atencao" style="flex:${falta || 0.0001}"></i><i class="p-espera" style="flex:${sem || 0.0001}"></i></div>
+        <ul class="saude">
+          <li><i class="ponto p-saudavel"></i><div><b>Compareceram</b><small>${pct(ok, base)} dos agendamentos</small></div><b class="qtd">${ok}</b></li>
+          <li><i class="ponto p-atencao"></i><div><b>Não compareceram</b><small>${pct(falta, base)} dos agendamentos</small></div><b class="qtd">${falta}</b></li>
+          <li><i class="ponto p-espera"></i><div><b>Sem registro de presença</b><small>marque Compareceu ou Faltou</small></div><b class="qtd">${sem}</b></li>
+        </ul>`;
+    }
   };
 
   const carregarProximos = async () => {
     const lista = await api('GET', `/api/agendamentos/contagem?data_inicio=${hoje()}&data_fim=${somarDias(hoje(), 13)}&status=agendado,confirmado&${f}`);
     $('#proximos').innerHTML = lista.length
       ? lista
+          .slice(0, 5)
           .map((d) => `<li data-dia="${d.data}"><span>${d.data === hoje() ? '<b>Hoje</b>' : `${diaSemana(d.data)}, ${dataBR(d.data).slice(0, 5)}`}</span><span class="contador">${d.total}</span></li>`)
           .join('')
       : `<li class="suave" style="cursor:default">Nenhum agendamento nos próximos 14 dias.</li>`;
@@ -347,37 +435,42 @@ TELAS.inicio = async (el) => {
     const primeiro = new Date(a, m - 1, 1);
     const inicio = new Date(a, m - 1, 1 - primeiro.getDay());
     const dias = Array.from({ length: 42 }, (_, i) => iso(new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate() + i)));
-    const cont = await api('GET', `/api/agendamentos/contagem?data_inicio=${dias[0]}&data_fim=${dias[41]}&${f}`);
-    const por = Object.fromEntries(cont.map((c) => [c.data, c]));
+    const lista = await api('GET', `/api/agendamentos?data_inicio=${dias[0]}&data_fim=${dias[41]}&status=agendado,confirmado,compareceu,faltou&${f}`);
+    const por = {};
+    for (const ag of lista) (por[ag.data] ||= []).push(ag);
     $('#cal').innerHTML =
       DIAS.map((d) => `<div class="sem">${d.slice(0, 3)}</div>`).join('') +
       dias
         .map((d) => {
-          const c = por[d];
-          const ativos = c ? c.total - c.cancelado : 0;
+          const ags = por[d] || [];
           const cls = [d.slice(0, 7) !== st.mes ? 'fora' : '', d === hoje() ? 'hoje' : '', d === st.dia ? 'sel' : ''].join(' ');
           return `<button class="${cls}" data-dia="${d}"><span class="dia">${Number(d.slice(8))}</span>
-            ${ativos ? `<span class="qtd">${ativos}</span>` : ''}
-            ${c && (c.compareceu || c.faltou) ? `<span class="pres"><span class="ok">✓ ${c.compareceu}</span><span class="falta">✗ ${c.faltou}</span></span>` : ''}</button>`;
+            ${ags.length ? `<span class="qtd">${ags.length}</span>` : ''}
+            ${ags.slice(0, 2).map((g) => `<span class="evento st-${g.status}">${g.hora} ${esc(g.cliente_nome.split(' ')[0])}</span>`).join('')}
+            ${ags.length > 2 ? `<span class="mais">+${ags.length - 2}</span>` : ''}</button>`;
         })
         .join('');
     $$('#cal [data-dia]').forEach((b) => (b.onclick = () => escolherDia(b.dataset.dia)));
   };
 
+  const ABAS_DIA = [['', 'Todos'], ['agendado,confirmado', 'Aguardando'], ['compareceu', 'Compareceram'], ['faltou', 'Não compareceram']];
   const carregarDia = async () => {
     const lista = await api('GET', `/api/agendamentos?data_inicio=${st.dia}&data_fim=${st.dia}&${f}`);
-    $('#dia').innerHTML = `<div class="cabeca" style="margin-bottom:12px"><h2 style="margin:0">${st.dia === hoje() ? 'Hoje' : diaSemana(st.dia)}, ${dataBR(st.dia)} · ${lista.filter((a) => a.status !== 'cancelado').length} agendamento(s)</h2></div>
-      ${tabelaAgendamentos(lista, { rapido: true })}`;
-    ligarTabela($('#dia'), lista, recarregar);
+    const filtrada = st.aba ? lista.filter((a) => st.aba.split(',').includes(a.status)) : lista;
+    $('#dia').innerHTML = `<div class="cartao-topo"><div><span class="kpi-rotulo">Agendamentos do dia</span><h2 style="margin:2px 0 0">${st.dia === hoje() ? 'Hoje' : diaSemana(st.dia)}, ${dataBR(st.dia)}</h2></div>
+        <div class="segmentos">${ABAS_DIA.map(([k, n]) => `<button data-aba="${k}" class="${st.aba === k ? 'ativo' : ''}">${n}</button>`).join('')}</div></div>
+      <div class="tabela-rolagem">${tabelaAgendamentos(filtrada, { rapido: true })}</div>`;
+    $$('#dia [data-aba]').forEach((b) => (b.onclick = () => ((st.aba = b.dataset.aba), carregarDia())));
+    ligarTabela($('#dia'), filtrada, recarregar);
   };
 
   const escolherDia = (d) => {
     st.dia = d;
     if (d.slice(0, 7) !== st.mes) st.mes = d.slice(0, 7);
     carregarMes();
-    carregarDia();
+    carregarDia().then(() => $('#dia').scrollIntoView({ behavior: 'smooth', block: 'start' }));
   };
-  const recarregar = () => Promise.all([carregarHoje(), carregarMes(), carregarDia(), carregarProximos()]);
+  const recarregar = () => Promise.all([carregarResumo(), carregarMes(), carregarDia(), carregarProximos()]);
   const mudarMes = (n) => {
     const [a, m] = st.mes.split('-').map(Number);
     st.mes = iso(new Date(a, m - 1 + n, 1)).slice(0, 7);
@@ -385,6 +478,10 @@ TELAS.inicio = async (el) => {
   };
   $('#mes-ant').onclick = () => mudarMes(-1);
   $('#mes-prox').onclick = () => mudarMes(1);
+  $('#mes-hoje').onclick = () => {
+    st.mes = hoje().slice(0, 7);
+    carregarMes();
+  };
   recarregar();
 };
 
@@ -549,25 +646,29 @@ function telaRemarcar(a, aoMudar) {
 TELAS.agendamentos = async (el) => {
   const st = (TELAS.agendamentos.st ||= { inicio: hoje(), fim: somarDias(hoje(), 30), status: '', origem: '', busca: '' });
   el.innerHTML = `
-    <div class="cabeca"><div><h1>Agendamentos</h1><p class="suave">Filtre por período, status ou cliente</p></div><div class="acoes"><button class="btn sec" id="csv">Exportar planilha</button>${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo</a>` : ''}</div></div>
-    <div class="cartao"><div class="linha">
-      <label>De<input type="date" id="f-ini" value="${st.inicio}"></label>
-      <label>Até<input type="date" id="f-fim" value="${st.fim}"></label>
-      <label>Status<select id="f-status"><option value="">Todos</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label>
-      <label>Origem<select id="f-origem"><option value="">Todas</option><option value="sistema">Sistema</option><option value="crm">CRM</option></select></label>
-      <label>Cliente<input id="f-busca" placeholder="Nome ou telefone" value="${esc(st.busca)}"></label>
-    </div></div>
+    <div class="cabeca"><div><h1>Agendamentos</h1><p class="suave">Todos os agendamentos da unidade, do sistema e do CRM.</p></div>
+      ${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo agendamento</a>` : ''}</div>
+    <div class="barra-filtros">
+      <div class="segmentos" id="f-origem">${[['', 'Todos', 'inicio'], ['sistema', 'Sistema', 'agendamentos'], ['crm', 'CRM Datacrazy', 'crm']]
+        .map(([k, n, ic]) => `<button data-o="${k}" class="${st.origem === k ? 'ativo' : ''}">${icone(ic)} ${n}</button>`)
+        .join('')}</div>
+      <label class="pilula periodo">${icone('agendamentos')}<input type="date" id="f-ini" value="${st.inicio}" aria-label="De"><span>–</span><input type="date" id="f-fim" value="${st.fim}" aria-label="Até"></label>
+    </div>
+    <div class="barra-filtros direita">
+      <select id="f-status" class="pilula" aria-label="Status"><option value="">Todos os status</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+      <label class="busca">${icone('busca')}<input id="f-busca" placeholder="Pesquisar cliente" value="${esc(st.busca)}" aria-label="Pesquisar cliente"></label>
+      <button class="btn sec" id="csv">${icone('baixar')} Exportar CSV</button>
+    </div>
     <div class="cartao tabela-rolagem" id="lista"></div>`;
   $('#f-status').value = st.status;
-  $('#f-origem').value = st.origem;
   let lista = [];
   const carregar = async () => {
-    Object.assign(st, { inicio: $('#f-ini').value, fim: $('#f-fim').value, status: $('#f-status').value, origem: $('#f-origem').value, busca: $('#f-busca').value.trim() });
+    Object.assign(st, { inicio: $('#f-ini').value, fim: $('#f-fim').value, status: $('#f-status').value, busca: $('#f-busca').value.trim() });
     const q = new URLSearchParams({ data_inicio: st.inicio, data_fim: st.fim });
     if (unidadeAtual()) q.set('loja_id', unidadeAtual());
     for (const k of ['status', 'origem', 'busca']) if (st[k]) q.set(k, st[k]);
     lista = await api('GET', '/api/agendamentos?' + q);
-    $('#lista').innerHTML = `<p class="suave" style="margin-top:0">${lista.length} agendamento(s)</p>` + tabelaAgendamentos(lista, { rapido: true, comData: true });
+    $('#lista').innerHTML = tabelaAgendamentos(lista, { rapido: true, comData: true }) + (lista.length ? `<p class="suave rodape-tabela">Mostrando ${lista.length} agendamento(s)</p>` : '');
     ligarTabela($('#lista'), lista, carregar);
   };
   let t;
@@ -575,7 +676,15 @@ TELAS.agendamentos = async (el) => {
     clearTimeout(t);
     t = setTimeout(carregar, 300);
   };
-  $$('#f-ini, #f-fim, #f-status, #f-origem').forEach((x) => (x.onchange = carregar));
+  $$('#f-ini, #f-fim, #f-status').forEach((x) => (x.onchange = carregar));
+  $$('#f-origem [data-o]').forEach(
+    (b) =>
+      (b.onclick = () => {
+        st.origem = b.dataset.o;
+        $$('#f-origem [data-o]').forEach((x) => x.classList.toggle('ativo', x === b));
+        carregar();
+      })
+  );
   $('#csv').onclick = () => {
     const linhas = [['Data', 'Hora', 'Unidade', 'Cliente', 'Telefone', 'Status', 'Origem', 'Observações']].concat(
       lista.map((a) => [dataBR(a.data), a.hora, a.loja_nome, a.cliente_nome, a.cliente_telefone || '', STATUS[a.status], a.origem === 'crm' ? 'CRM' : 'Sistema', a.observacoes || ''])
@@ -696,7 +805,6 @@ TELAS.relatorios = async (el) => {
       <label>Até<input type="date" id="fim" value="${hoje()}"></label>
     </div></div>
     <div id="res"></div>`;
-  const pct = (a, b) => (b ? Math.round((a / b) * 100) + '%' : '—');
   const carregar = async () => {
     const q = new URLSearchParams({ inicio: $('#ini').value, fim: $('#fim').value });
     if (unidadeAtual()) q.set('loja_id', unidadeAtual());
@@ -710,13 +818,13 @@ TELAS.relatorios = async (el) => {
           : vazio('Sem dados no período.')
       }</div>`;
     $('#res').innerHTML = `
-      <div class="metricas">
-        <div class="metrica destaque"><b>${pct(g.compareceu, g.compareceu + g.faltou)}</b><span>Taxa de comparecimento</span></div>
-        <div class="metrica t-neutro"><b>${g.total}</b><span>Agendamentos</span></div>
-        <div class="metrica t-ok"><b>${g.compareceu || 0}</b><span>Compareceram</span></div>
-        <div class="metrica t-falta"><b>${g.faltou || 0}</b><span>Não compareceram</span></div>
-        <div class="metrica t-neutro"><b>${g.cancelado || 0}</b><span>Cancelados</span></div>
-        <div class="metrica t-espera"><b>${(g.agendado || 0) + (g.confirmado || 0)}</b><span>Sem registro de presença</span></div>
+      <div class="kpis kpis-6">
+        ${kpi('Comparecimento', pct(g.compareceu, g.compareceu + g.faltou), 'entre os que tiveram presença marcada', 'relatorios', 'destaque')}
+        ${kpi('Agendamentos', g.total, 'no período', 'agendamentos')}
+        ${kpi('Compareceram', g.compareceu || 0, 'clientes atendidos', 'ok', 't-ok')}
+        ${kpi('Não compareceram', g.faltou || 0, 'oportunidade de remarcar', 'falta', 't-falta')}
+        ${kpi('Cancelados', g.cancelado || 0, 'no período', 'novo')}
+        ${kpi('Sem registro', (g.agendado || 0) + (g.confirmado || 0), 'falta marcar presença', 'inicio')}
       </div>
       ${!unidadeAtual() ? tabela('Por unidade', r.por_unidade, 'Unidade') : ''}
       ${tabela('Por origem', r.por_origem.map((o) => ({ ...o, nome: o.origem === 'crm' ? 'CRM (Datacrazy)' : 'Sistema' })), 'Origem')}`;
@@ -730,7 +838,7 @@ const ABAS = [
   ['unidades', 'Unidades', () => pode('unidades')],
   ['usuarios', 'Usuários', () => pode('usuarios')],
   ['horarios', 'Horários', () => pode('horarios')],
-  ['integracao', 'Integração CRM', () => pode('integracao')],
+  ['integracao', 'Integrações', () => pode('integracao')],
   ['logs', 'Logs', () => pode('logs')],
 ];
 const CONFIG = {};
@@ -982,78 +1090,102 @@ CONFIG.horarios = async (el) => {
   );
 };
 
-// Integração com o CRM
+// Integrações (cartões, com detalhes em janela)
 CONFIG.integracao = async (el) => {
   const c = await api('GET', '/api/integracao');
+  const recebeu = c.eventos.find((e) => e.direcao === 'entrada' && e.sucesso);
+  const enviou = c.eventos.find((e) => e.direcao === 'saida');
+  const status = (ok, texto) => (ok ? `<span class="ativa">${icone('ok')} Ativa</span>` : `<span class="suave">${texto}</span>`);
+  const cartao = (id, logo, nome, ativo, sub, botao) =>
+    `<div class="integracao"><span class="logo-int">${logo}</span><div class="info"><b>${nome} ${ativo ? status(true) : ''}</b><small>${sub}</small></div>
+      <button class="btn sec peq" data-int="${id}">${icone(botao === 'Conectar' ? 'link' : 'configuracoes')} ${botao}</button></div>`;
+  const logoDc = '<span class="logo-dc">DC</span>';
+  el.innerHTML = `
+    <p class="suave" style="margin-top:0">Conecte o CRM que envia e recebe os agendamentos.</p>
+    <h3 class="secao">CRM</h3>
+    <div class="integracoes">
+      ${cartao('entrada', logoDc, 'Datacrazy · receber agendamentos', !!recebeu, recebeu ? `Último recebido em ${esc(recebeu.criado_em)} (UTC)` : 'Aguardando o primeiro envio do CRM', recebeu ? 'Gerenciar' : 'Conectar')}
+      ${cartao('saida', logoDc, 'Datacrazy · enviar presença', !!c.saida_url, c.saida_url ? (enviou ? (enviou.sucesso ? 'Último envio aceito pelo CRM' : 'Último envio falhou') : 'Configurado, nenhum envio ainda') : 'Nenhuma integração', c.saida_url ? 'Gerenciar' : 'Conectar')}
+    </div>
+    <h3 class="secao">Outras fontes</h3>
+    <p class="suave" style="margin:-6px 0 12px;font-size:.85rem">Qualquer sistema que envie um webhook (formulário, site, outro CRM) pode criar agendamentos aqui.</p>
+    <div class="integracoes">
+      ${cartao('entrada', `<span class="logo-int-icone">${icone('webhook')}</span>`, 'Webhook', false, 'Usa o mesmo endereço de entrada', 'Gerenciar')}
+    </div>
+    <h3 class="secao">Últimos eventos</h3>
+    <div class="cartao tabela-rolagem">
+      ${
+        c.eventos.length
+          ? `<table><thead><tr><th>Quando (UTC)</th><th>Direção</th><th>Evento</th><th>Resultado</th><th class="esconder-celular">Detalhe</th></tr></thead><tbody>
+        ${c.eventos.map((e) => `<tr><td>${esc(e.criado_em)}</td><td>${e.direcao === 'entrada' ? 'CRM → sistema' : 'sistema → CRM'}</td><td>${esc(e.evento)}</td>
+          <td>${e.sucesso ? '<span class="selo st-compareceu">ok</span>' : '<span class="selo st-faltou">falhou</span>'}</td><td class="esconder-celular suave" style="max-width:380px;word-break:break-word">${esc(e.detalhe)}</td></tr>`).join('')}</tbody></table>`
+          : vazio('Nenhum evento ainda.')
+      }
+    </div>`;
+  const recarregar = () => CONFIG.integracao(el);
   const exemplo = JSON.stringify(
     { id: 'id-do-negocio-no-crm', lead: { id: 'id-do-lead', name: 'Nome do cliente', phone: '(47) 99999-0000' }, unidade: 'Aventureiro', data: '30/10/2026', hora: '14:30' },
     null,
     2
   );
-  el.innerHTML = `
-    <div class="cartao">
-      <h2>1. Receber agendamentos do CRM (Datacrazy → sistema)</h2>
+  const abrirEntrada = () => {
+    const m = abrirModal(`
+      <h2>Receber agendamentos do CRM</h2>
       <p class="suave">No Datacrazy, crie uma automação que envie um <b>webhook (POST)</b> para o endereço abaixo quando um agendamento for feito. Se o mesmo negócio for enviado de novo, o agendamento é atualizado, não duplicado. Envie <code>"status": "cancelado"</code> para cancelar.</p>
       <label>Endereço do webhook (mantenha em sigilo)</label>
-      <code class="bloco" id="url-entrada">${esc(c.url_entrada)}</code>
-      <div class="acoes" style="margin:10px 0 14px"><button class="btn sec peq" id="copiar">Copiar endereço</button><button class="btn sec peq" id="novo-token">Gerar novo endereço</button></div>
+      <code class="bloco">${esc(c.url_entrada)}</code>
+      <div class="acoes" style="margin:12px 0 16px"><button class="btn sec peq" id="copiar">Copiar endereço</button><button class="btn sec peq" id="novo-token">Gerar novo endereço</button></div>
       <details><summary>Exemplo do que enviar</summary><code class="bloco">${esc(exemplo)}</code>
-        <p class="suave">A unidade pode ser o nome (ou parte dele) ou o código da unidade. A data aceita 30/10/2026 ou 2026-10-30, e a hora pode vir junto (2026-10-30T14:30).</p></details>
-    </div>
-    <div class="cartao">
-      <h2>2. Avisar o CRM (sistema → Datacrazy)</h2>
-      <p class="suave">A cada agendamento criado, remarcado, cancelado ou com presença marcada aqui, o sistema envia um POST para este endereço (ex.: o webhook de entrada de uma automação do Datacrazy).</p>
+        <p class="suave">A unidade pode ser o nome (ou parte dele) ou o código da unidade. A data aceita 30/10/2026 ou 2026-10-30, e a hora pode vir junto (2026-10-30T14:30).</p></details>`);
+    $('#copiar', m).onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(c.url_entrada);
+        avisar('Endereço copiado.');
+      } catch {
+        avisar('Selecione e copie o endereço manualmente.', true);
+      }
+    };
+    $('#novo-token', m).onclick = async () => {
+      if (!confirm('O endereço atual vai parar de funcionar. Continuar?')) return;
+      await api('POST', '/api/integracao/novo-token', {});
+      fecharModal();
+      recarregar();
+    };
+  };
+  const abrirSaida = () => {
+    const m = abrirModal(`
+      <h2>Enviar presença ao CRM</h2>
+      <p class="suave">A cada agendamento criado, remarcado, cancelado ou com presença marcada aqui, o sistema envia um POST para este endereço (por exemplo, o webhook de entrada de uma automação do Datacrazy).</p>
       <form id="fs">
         <label>URL que recebe os eventos<input name="saida_url" placeholder="https://..." value="${esc(c.saida_url)}"></label>
         <label>Token enviado no cabeçalho X-Webhook-Token (opcional)<input name="saida_token" placeholder="${c.saida_token_definido ? '•••••• (definido; preencha para trocar)' : ''}" autocomplete="off"></label>
         <p class="erro"></p>
         <div class="acoes"><button class="btn" type="submit">Salvar</button><button class="btn sec" type="button" id="testar">Enviar teste</button></div>
-      </form>
-    </div>
-    <div class="cartao tabela-rolagem">
-      <h2>Últimos eventos</h2>
-      ${
-        c.eventos.length
-          ? `<table><thead><tr><th>Quando (UTC)</th><th>Direção</th><th>Evento</th><th>Resultado</th><th class="esconder-celular">Detalhe</th></tr></thead><tbody>
-        ${c.eventos.map((e) => `<tr><td>${esc(e.criado_em)}</td><td>${e.direcao === 'entrada' ? 'CRM → sistema' : 'sistema → CRM'}</td><td>${esc(e.evento)}</td>
-          <td>${e.sucesso ? '✓ ok' : '✗ falhou'}</td><td class="esconder-celular suave" style="max-width:380px;word-break:break-word">${esc(e.detalhe)}</td></tr>`).join('')}</tbody></table>`
-          : '<p class="suave">Nenhum evento ainda.</p>'
+      </form>`);
+    const fs = $('#fs', m);
+    fs.onsubmit = (e) => {
+      e.preventDefault();
+      tentar(fs, async () => {
+        const d = dadosForm(fs);
+        if (!d.saida_token) delete d.saida_token;
+        await api('PUT', '/api/integracao', d);
+        avisar('Integração salva.');
+        fecharModal();
+        recarregar();
+      });
+    };
+    $('#testar', m).onclick = async () => {
+      try {
+        const r = await api('POST', '/api/integracao/testar', {});
+        avisar(r.enviado ? 'Teste enviado com sucesso.' : `O CRM não aceitou o teste${r.status ? ` (HTTP ${r.status})` : ''}.`, !r.enviado);
+        fecharModal();
+        recarregar();
+      } catch (e) {
+        avisar(e.message, true);
       }
-    </div>`;
-  const recarregar = () => CONFIG.integracao(el);
-  $('#copiar', el).onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(c.url_entrada);
-      avisar('Endereço copiado.');
-    } catch {
-      avisar('Selecione e copie o endereço manualmente.', true);
-    }
+    };
   };
-  $('#novo-token', el).onclick = async () => {
-    if (!confirm('O endereço atual vai parar de funcionar. Continuar?')) return;
-    await api('POST', '/api/integracao/novo-token', {});
-    recarregar();
-  };
-  const fs = $('#fs', el);
-  fs.onsubmit = (e) => {
-    e.preventDefault();
-    tentar(fs, async () => {
-      const d = dadosForm(fs);
-      if (!d.saida_token) delete d.saida_token;
-      await api('PUT', '/api/integracao', d);
-      avisar('Integração salva.');
-      recarregar();
-    });
-  };
-  $('#testar', el).onclick = async () => {
-    try {
-      const r = await api('POST', '/api/integracao/testar', {});
-      avisar(r.enviado ? 'Teste enviado com sucesso.' : `O CRM não aceitou o teste${r.status ? ` (HTTP ${r.status})` : ''}.`, !r.enviado);
-      recarregar();
-    } catch (e) {
-      avisar(e.message, true);
-    }
-  };
+  $$('[data-int]', el).forEach((b) => (b.onclick = () => (b.dataset.int === 'saida' ? abrirSaida() : abrirEntrada())));
 };
 
 // Logs (somente administrador principal)

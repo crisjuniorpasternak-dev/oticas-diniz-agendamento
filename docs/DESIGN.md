@@ -22,6 +22,18 @@ O calendário também se adapta. Cada dia é um cartão com a contagem e as pres
 
 **Padrão de navegação:** os mesmos 4 ou 5 destinos aparecem em todas as faixas, sempre na mesma ordem: Início, Agenda, Novo, Relatórios e Ajustes. A unidade escolhida fica sempre no topo. Assim a pessoa não precisa reaprender o menu ao trocar de aparelho.
 
+### Painel inspirado no Metrifiquei
+
+- **Menu lateral claro** com as seções Agenda e Gestão. O item ativo fica com fundo vermelho bem claro, e o cartão do usuário fica no rodapé do menu.
+- **Cartões de números compactos**: rótulo em caixa alta, número grande e uma linha de contexto, com o ícone à direita.
+- **Início**: gráfico de barras empilhadas dos últimos 30 dias, mostrando quem compareceu, quem não compareceu e quem ainda aguarda.
+  - Com todas as unidades selecionadas, aparece o bloco "Saúde das unidades": crítico abaixo de 60% de comparecimento, atenção de 60% a 79% e saudável a partir de 80%.
+  - Com uma unidade selecionada, o bloco mostra a situação dos atendimentos dela.
+  - O calendário traz os agendamentos com hora e nome, coloridos pelo status.
+  - A lista do dia tem abas por status.
+- **Agendamentos**: alternância Todos / Sistema / CRM Datacrazy, período, status, pesquisa e Exportar CSV na mesma barra.
+- **Integrações**: cartões por conexão, com o selo "Ativa", e os detalhes abrem em uma janela.
+
 ## 2. Microinterações
 
 Os tempos usados são rápido 120ms, médio 200ms e lento 320ms. As curvas são `cubic-bezier(.2,.8,.2,1)` para saídas suaves e `cubic-bezier(.34,1.56,.64,1)` para o efeito de mola na confirmação.
