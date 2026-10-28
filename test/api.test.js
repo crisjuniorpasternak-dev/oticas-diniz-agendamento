@@ -180,8 +180,40 @@ test('webhook de entrada do CRM', async () => {
   assert.strictEqual((await enviar({ id: 'neg-3', name: 'X', unidade: 'Inexistente', data: '2026-11-06', hora: '09:00' })).status, 422);
   assert.strictEqual((await enviar({ id: 'neg-2', status: 'cancelado' })).corpo.status, 'cancelado');
 
+  // Erros explicam o problema
+  const semToken = await enviar({}, 'json', url.pathname);
+  assert.strictEqual(semToken.corpo.codigo, 'TOKEN_AUSENTE');
+  const casos = [
+    [{ id: 'e1', name: 'X', unidade: 'Centro', hora: '10:00' }, 'DATA_AUSENTE'],
+    [{ id: 'e1', name: 'X', unidade: 'Centro', data: '31-12-2026', hora: '10:00' }, 'DATA_INVALIDA'],
+    [{ id: 'e1', name: 'X', unidade: 'Centro', data: '2026-11-06' }, 'HORA_AUSENTE'],
+    [{ id: 'e1', name: 'X', unidade: 'Centro', data: '2026-11-06', hora: 'manhã' }, 'HORA_INVALIDA'],
+    [{ id: 'e1', name: 'X', data: '2026-11-06', hora: '10:00' }, 'UNIDADE_AUSENTE'],
+    [{ id: 'e1', name: 'X', unidade: 'Inexistente', data: '2026-11-06', hora: '10:00' }, 'UNIDADE_NAO_ENCONTRADA'],
+    [{ id: 'e1', name: 'X', unidade: 'Óticas', data: '2026-11-06', hora: '10:00' }, 'UNIDADE_AMBIGUA'],
+    [{ id: 'e1', unidade: 'Centro', data: '2026-11-06', hora: '10:00' }, 'CLIENTE_AUSENTE'],
+    [{ id: 'nao-existe', status: 'cancelado' }, 'AGENDAMENTO_NAO_ENCONTRADO'],
+  ];
+  for (const [corpo, codigo] of casos) {
+    const r2 = await enviar(corpo);
+    assert.strictEqual(r2.corpo.codigo, codigo, JSON.stringify(r2.corpo));
+    assert.strictEqual(r2.corpo.ok, false);
+    assert.ok(r2.status >= 400 && r2.corpo.erro);
+  }
+  const naoEncontrada = await enviar(casos[5][0]);
+  assert.ok(naoEncontrada.corpo.unidades_disponiveis.length >= 3);
+  const jsonRuim = await fetch(base + caminho, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{ruim' }).then((x) => x.json());
+  assert.strictEqual(jsonRuim.codigo, 'JSON_INVALIDO');
+
+  // Data com fuso (como o Datacrazy envia) vira o dia de Brasília; data passada é salva com aviso
+  const passado = await enviar({ id: 'neg-z', lead: { name: 'Gi' }, unidade: 'Centro', data: '2026-10-30T02:00:00.000Z', hora: '17:45' });
+  assert.strictEqual(passado.status, 201, JSON.stringify(passado.corpo));
+  assert.strictEqual(passado.corpo.data, '2026-10-29');
+  assert.ok(passado.corpo.avisos.some((a) => a.includes('já passou')));
+
   const eventos = (await adm('GET', '/api/integracao')).corpo.eventos;
   assert.ok(eventos.filter((e) => e.direcao === 'entrada').length >= 4);
+  assert.ok(eventos.some((e) => !e.sucesso && e.detalhe.includes('UNIDADE_NAO_ENCONTRADA')));
 });
 
 test('webhook de saída avisa o CRM sobre presença', async () => {

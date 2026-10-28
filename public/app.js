@@ -665,7 +665,7 @@ function telaRemarcar(a, aoMudar) {
 
 // ---------- Lista de agendamentos ----------
 TELAS.agendamentos = async (el) => {
-  const st = (TELAS.agendamentos.st ||= { inicio: hoje(), fim: somarDias(hoje(), 30), status: '', origem: '', busca: '' });
+  const st = (TELAS.agendamentos.st ||= { inicio: somarDias(hoje(), -7), fim: somarDias(hoje(), 30), status: '', origem: '', busca: '' });
   el.innerHTML = `
     <div class="cabeca"><div><h1>Agendamentos</h1><p class="suave">Todos os agendamentos da unidade, do sistema e do CRM.</p></div>
       ${pode('agendar') ? `<a class="btn" href="#/novo">${icone('novo')} Novo agendamento</a>` : ''}</div>
@@ -1169,7 +1169,12 @@ CONFIG.integracao = async (el) => {
       <code class="bloco">${esc(c.url_entrada)}</code>
       <div class="acoes" style="margin:12px 0 16px"><button class="btn sec peq" id="copiar">Copiar endereço</button><button class="btn sec peq" id="novo-token">Gerar novo endereço</button></div>
       <details><summary>Exemplo do que enviar</summary><code class="bloco">${esc(exemplo)}</code>
-        <p class="suave">A unidade pode ser o nome (ou parte dele) ou o código da unidade. A data aceita 30/10/2026 ou 2026-10-30, e a hora pode vir junto (2026-10-30T14:30).</p></details>`);
+        <p class="suave">A unidade pode ser o nome (ou parte dele) ou o código da unidade. A data aceita 30/10/2026 ou 2026-10-30, e a hora pode vir junto (2026-10-30T14:30). Datas com fuso (…Z) são convertidas para o horário de Brasília.</p></details>
+      <details><summary>Respostas e erros</summary>
+        <p class="suave">Deu certo: HTTP 201 (criado) ou 200 (atualizado) com <code>"ok": true</code>, o número do agendamento e, se houver, <code>"avisos"</code> (por exemplo, data que já passou).</p>
+        <p class="suave">Deu errado: HTTP 4xx com <code>"ok": false</code>, <code>"codigo"</code>, <code>"erro"</code> (o que houve), <code>"campo"</code> e <code>"como_corrigir"</code>. Códigos: TOKEN_AUSENTE, TOKEN_INVALIDO, CORPO_VAZIO, JSON_INVALIDO, DATA_AUSENTE, DATA_INVALIDA, HORA_AUSENTE, HORA_INVALIDA, UNIDADE_AUSENTE, UNIDADE_NAO_ENCONTRADA, UNIDADE_AMBIGUA, CLIENTE_AUSENTE, AGENDAMENTO_NAO_ENCONTRADO.</p>
+        <code class="bloco">${esc(JSON.stringify({ ok: false, codigo: 'UNIDADE_NAO_ENCONTRADA', erro: 'Unidade "Norte" não encontrada.', campo: 'unidade', recebido: 'Norte', unidades_disponiveis: estado.lojas.map((l) => l.nome).slice(0, 3), como_corrigir: 'Envie o nome (ou parte dele) ou o código de uma das unidades disponíveis.' }, null, 2))}</code>
+        <p class="suave">Todas as chamadas, com o que foi recebido e a resposta, ficam em "Últimos eventos" nesta tela.</p></details>`);
     $('#copiar', m).onclick = async () => {
       try {
         await navigator.clipboard.writeText(c.url_entrada);

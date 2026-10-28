@@ -694,39 +694,74 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
   });
 
   // Recebe agendamentos feitos no CRM. Autenticado pelo token da URL (ou cabeçalho X-Webhook-Token).
+  // Toda resposta traz "ok"; nos erros vêm também "codigo", "erro" (o que houve), "campo" e "como_corrigir".
   app.post(WEBHOOK, express.urlencoded({ extended: true }), async (req, res) => {
     const token = req.query.token || req.get('x-webhook-token');
     const esperado = await tokenEntrada();
-    const ok = token && token.length === esperado.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(esperado));
-    if (!ok) return res.status(401).json({ erro: 'Token inválido.' });
+    const valido = token && token.length === esperado.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(esperado));
+    if (!valido) {
+      const corpo = {
+        ok: false,
+        codigo: token ? 'TOKEN_INVALIDO' : 'TOKEN_AUSENTE',
+        erro: token ? 'O token do endereço não confere.' : 'O endereço foi chamado sem o token.',
+        como_corrigir: 'Copie o endereço completo (com ?token=...) em Configurações → Integrações → Receber agendamentos.',
+      };
+      await integracao.registrar(db, 'entrada', 'agendamento', false, JSON.stringify({ resposta: corpo }));
+      return res.status(401).json(corpo);
+    }
 
     const d = integracao.interpretarEntrada(req.body);
-    const responder = async (status, corpo, sucesso) => {
-      await integracao.registrar(db, 'entrada', d.cancelar ? 'cancelamento' : 'agendamento', sucesso, JSON.stringify({ resposta: corpo, recebido: req.body }));
+    const responder = async (status, corpo) => {
+      await integracao.registrar(db, 'entrada', d.cancelar ? 'cancelamento' : 'agendamento', !!corpo.ok, JSON.stringify({ resposta: corpo, recebido: req.body }));
       res.status(status).json(corpo);
     };
+    const recusar = (status, codigo, erro, extra = {}) => responder(status, { ok: false, codigo, erro, ...extra });
+    const nomesUnidades = (lista) => lista.map((l) => l.nome);
     try {
+      if (!req.body || !Object.keys(req.body).length)
+        return recusar(400, 'CORPO_VAZIO', 'Nenhum dado foi recebido.', { como_corrigir: 'Envie os dados do agendamento em JSON (Content-Type: application/json).' });
+
       const existente = d.id_externo
         ? await db.get("SELECT * FROM agendamentos WHERE origem = 'crm' AND id_externo = ?", String(d.id_externo))
         : null;
 
       if (d.cancelar) {
-        if (!existente) return responder(404, { erro: 'Agendamento não encontrado para cancelar.' }, false);
+        if (!d.id_externo) return recusar(422, 'ID_AUSENTE', 'Para cancelar, envie o "id" do negócio no CRM.', { campo: 'id' });
+        if (!existente)
+          return recusar(404, 'AGENDAMENTO_NAO_ENCONTRADO', `Nenhum agendamento do CRM com id "${d.id_externo}" para cancelar.`, { campo: 'id', recebido: d.id_externo });
         await db.run("UPDATE agendamentos SET status = 'cancelado', motivo_cancelamento = 'Cancelado no CRM', atualizado_em = datetime('now') WHERE id = ?", existente.id);
-        return responder(200, { ok: true, agendamento_id: existente.id, status: 'cancelado' }, true);
+        return responder(200, { ok: true, agendamento_id: existente.id, status: 'cancelado' });
       }
 
-      if (!d.data || !d.hora) return responder(422, { erro: 'Envie data e hora do agendamento.' }, false);
+      const FORMATOS = 'Formatos aceitos: "30/10/2026", "2026-10-30" ou "2026-10-30T14:30:00-03:00".';
+      if (d.data_recebida === undefined)
+        return recusar(422, 'DATA_AUSENTE', 'Falta a data do exame.', { campo: 'data', como_corrigir: `Envie o campo "data". ${FORMATOS}` });
+      if (!d.data)
+        return recusar(422, 'DATA_INVALIDA', `Não foi possível ler a data "${d.data_recebida}".`, { campo: 'data', recebido: d.data_recebida, como_corrigir: FORMATOS });
+      if (!d.hora)
+        return d.hora_recebida === undefined
+          ? recusar(422, 'HORA_AUSENTE', 'Falta o horário do exame.', { campo: 'hora', como_corrigir: 'Envie o campo "hora" no formato "14:30", ou a hora junto da data.' })
+          : recusar(422, 'HORA_INVALIDA', `Não foi possível ler a hora "${d.hora_recebida}".`, { campo: 'hora', recebido: d.hora_recebida, como_corrigir: 'Use o formato "14:30".' });
+
       const lojas = await db.all('SELECT id, nome FROM lojas WHERE ativa = 1');
-      const u = d.unidade !== undefined ? String(d.unidade).trim().toLowerCase() : null;
-      const loja = u
-        ? lojas.find((l) => String(l.id) === u) ||
-          lojas.find((l) => l.nome.toLowerCase() === u) ||
-          lojas.find((l) => l.nome.toLowerCase().includes(u))
-        : lojas.length === 1
-          ? lojas[0]
-          : null;
-      if (!loja) return responder(422, { erro: 'Unidade não encontrada. Envie "unidade" com o nome ou o código da unidade.' }, false);
+      let loja;
+      if (d.unidade === undefined) {
+        if (lojas.length !== 1)
+          return recusar(422, 'UNIDADE_AUSENTE', 'Falta a unidade do agendamento.', { campo: 'unidade', unidades_disponiveis: nomesUnidades(lojas), como_corrigir: 'Envie "unidade" com o nome (ou parte dele) ou o código da unidade.' });
+        loja = lojas[0];
+      } else {
+        const u = String(d.unidade).trim().toLowerCase();
+        const exata = lojas.find((l) => String(l.id) === u) || lojas.find((l) => l.nome.toLowerCase() === u);
+        const parciais = lojas.filter((l) => l.nome.toLowerCase().includes(u));
+        if (!exata && parciais.length > 1)
+          return recusar(422, 'UNIDADE_AMBIGUA', `"${d.unidade}" corresponde a mais de uma unidade.`, { campo: 'unidade', recebido: d.unidade, unidades_encontradas: nomesUnidades(parciais), como_corrigir: 'Envie o nome completo ou o código da unidade.' });
+        loja = exata || parciais[0];
+        if (!loja)
+          return recusar(422, 'UNIDADE_NAO_ENCONTRADA', `Unidade "${d.unidade}" não encontrada.`, { campo: 'unidade', recebido: d.unidade, unidades_disponiveis: nomesUnidades(lojas), como_corrigir: 'Envie o nome (ou parte dele) ou o código de uma das unidades disponíveis.' });
+      }
+
+      if (!existente && !String(d.cliente.nome || '').trim() && !d.cliente.crm_id && String(d.cliente.telefone || '').replace(/\D/g, '').length < 8)
+        return recusar(422, 'CLIENTE_AUSENTE', 'Faltam os dados do cliente.', { campo: 'lead.name', como_corrigir: 'Envie ao menos o nome do cliente (lead.name ou nome).' });
 
       const id = await db.transacao(async (tx) => {
         const clienteId = await obterCliente(tx, d.cliente);
@@ -746,10 +781,23 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
         ).lastInsertRowid;
       });
       await auditar(null, existente ? 'atualizar_crm' : 'criar_crm', 'agendamento', id, { id_externo: d.id_externo });
-      return responder(existente ? 200 : 201, { ok: true, agendamento_id: id, unidade: loja.nome, data: d.data, hora: d.hora }, true);
+      const avisos = [];
+      if (`${d.data} ${d.hora}` < `${agenda.hojeISO(agora())} ${String(agora().getHours()).padStart(2, '0')}:${String(agora().getMinutes()).padStart(2, '0')}`)
+        avisos.push(`A data do exame (${d.data.split('-').reverse().join('/')} às ${d.hora}) já passou. O agendamento foi salvo mesmo assim.`);
+      if (!d.id_externo) avisos.push('Sem "id" do negócio: se o CRM reenviar, será criado outro agendamento em vez de atualizar este.');
+      return responder(existente ? 200 : 201, {
+        ok: true,
+        acao: existente ? 'atualizado' : 'criado',
+        agendamento_id: id,
+        unidade: loja.nome,
+        data: d.data,
+        hora: d.hora,
+        ...(avisos.length ? { avisos } : {}),
+      });
     } catch (e) {
-      if (e instanceof ErroHttp) return responder(e.status === 400 ? 422 : e.status, { erro: e.message }, false);
-      throw e;
+      if (e instanceof ErroHttp) return recusar(e.status === 400 ? 422 : e.status, 'DADOS_INVALIDOS', e.message);
+      console.error(e);
+      return recusar(500, 'ERRO_INTERNO', `Erro interno ao salvar o agendamento: ${e.message}`, { como_corrigir: 'Tente reenviar. Se continuar, avise o suporte com este código.' });
     }
   });
 
@@ -768,7 +816,8 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
 
   app.use((err, req, res, next) => {
     if (err instanceof ErroHttp) return res.status(err.status).json({ erro: err.message });
-    if (err.type === 'entity.parse.failed') return res.status(400).json({ erro: 'JSON inválido.' });
+    if (err.type === 'entity.parse.failed')
+      return res.status(400).json({ ok: false, codigo: 'JSON_INVALIDO', erro: 'O corpo enviado não é um JSON válido.', detalhe: err.message });
     console.error(err);
     res.status(500).json({ erro: 'Erro interno. Tente novamente.' });
   });

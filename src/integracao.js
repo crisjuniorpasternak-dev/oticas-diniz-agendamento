@@ -14,13 +14,28 @@ function pegar(obj, ...caminhos) {
   return undefined;
 }
 
-// Aceita "2026-10-29", "29/10/2026", "2026-10-29T14:30:00-03:00" e "29/10/2026 14:30"
+// Aceita "2026-10-29", "29/10/2026", "2026-10-29T14:30:00-03:00" e "29/10/2026 14:30".
+// Datas com fuso (Z ou -03:00) são convertidas para o horário de Brasília.
+const FUSO = 'America/Sao_Paulo';
+function noFusoLocal(instante) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat('en-CA', { timeZone: FUSO, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+      .formatToParts(instante)
+      .map((x) => [x.type, x.value])
+  );
+  return { data: `${p.year}-${p.month}-${p.day}`, hora: `${p.hour}:${p.minute}` };
+}
+
 function lerDataHora(textoData, textoHora) {
   let data;
-  let hora = textoHora ? String(textoHora).slice(0, 5) : undefined;
+  let hora = textoHora ? String(textoHora).trim().slice(0, 5) : undefined;
   const t = String(textoData || '').trim();
-  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
-  if (m) {
+  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/);
+  if (m && m[6] && !Number.isNaN(Date.parse(t))) {
+    const local = noFusoLocal(new Date(t));
+    data = local.data;
+    if (!hora) hora = local.hora;
+  } else if (m) {
     data = `${m[1]}-${m[2]}-${m[3]}`;
     if (m[4] && !hora) hora = `${m[4]}:${m[5]}`;
   } else if ((m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/))) {
@@ -35,11 +50,12 @@ const CANCELAMENTO = /^(cancel|desmarc|excluid|removid|perdid)/i;
 
 function interpretarEntrada(corpo) {
   const b = corpo || {};
-  const { data, hora } = lerDataHora(
-    pegar(b, 'data_hora', 'datahora', 'agendamento.data_hora', 'scheduledAt', 'data', 'date', 'agendamento.data'),
-    pegar(b, 'hora', 'time', 'agendamento.hora')
-  );
+  const data_recebida = pegar(b, 'data_hora', 'datahora', 'agendamento.data_hora', 'scheduledAt', 'data', 'date', 'agendamento.data');
+  const hora_recebida = pegar(b, 'hora', 'time', 'agendamento.hora');
+  const { data, hora } = lerDataHora(data_recebida, hora_recebida);
   return {
+    data_recebida,
+    hora_recebida,
     id_externo: pegar(b, 'id_externo', 'agendamento.id', 'business.id', 'negocio.id', 'deal.id', 'id'),
     cliente: {
       crm_id: pegar(b, 'cliente.id', 'lead.id', 'lead_id', 'contact.id'),

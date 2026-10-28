@@ -41,14 +41,16 @@ O administrador principal é o primeiro administrador (criado por `ADMIN_EMAIL`/
 
 ## Integração com o CRM
 
-Em **Configurações → Integração CRM**:
+Em **Integrações** (menu lateral):
 
 1. **Entrada (CRM → sistema):** endereço de webhook com token. O CRM envia um POST com cliente, unidade, data e hora. Reenviar o mesmo `id` atualiza o agendamento em vez de duplicar, e `"status": "cancelado"` cancela.
    ```json
    { "id": "id-do-negocio", "lead": { "id": "id-do-lead", "name": "Nome", "phone": "(47) 99999-0000" },
      "unidade": "Aventureiro", "data": "30/10/2026", "hora": "14:30" }
    ```
-   Também aceita `nome`, `telefone`, `email`, `data_hora` (ISO), `unidade_id` e envio como formulário.
+   Também aceita `nome`, `telefone`, `email`, `data_hora` (ISO), `unidade_id` e envio como formulário. Datas com fuso (`...Z`) são convertidas para o horário de Brasília.
+
+   Respostas: `201`/`200` com `"ok": true` (e `"avisos"` quando, por exemplo, a data já passou). Em erro, `4xx` com `"ok": false`, `"codigo"`, `"erro"`, `"campo"` e `"como_corrigir"`. Códigos: `TOKEN_AUSENTE`, `TOKEN_INVALIDO`, `CORPO_VAZIO`, `JSON_INVALIDO`, `DATA_AUSENTE`, `DATA_INVALIDA`, `HORA_AUSENTE`, `HORA_INVALIDA`, `UNIDADE_AUSENTE`, `UNIDADE_NAO_ENCONTRADA` (traz `unidades_disponiveis`), `UNIDADE_AMBIGUA`, `CLIENTE_AUSENTE`, `AGENDAMENTO_NAO_ENCONTRADO`.
 2. **Saída (sistema → CRM):** URL que recebe um POST a cada evento: `agendamento.criado`, `agendamento.remarcado`, `agendamento.confirmado`, `agendamento.compareceu`, `agendamento.faltou`, `agendamento.cancelado`. O corpo traz o agendamento (com `id_externo` do CRM e `compareceu: true/false`), a unidade e o cliente (com `crm_id`). Um token opcional vai no cabeçalho `X-Webhook-Token`.
 
 Os últimos eventos, com sucesso ou falha, aparecem na mesma tela.
