@@ -220,3 +220,51 @@ test('usuário desativado perde acesso', async () => {
   assert.strictEqual((await adm('PUT', `/api/usuarios/${ids.recepcao}`, { ativo: false })).status, 200);
   assert.strictEqual((await rec('GET', '/api/agendamentos')).status, 401);
 });
+
+test('supervisor acompanha só as unidades escolhidas pelo administrador', async () => {
+  const adm = await entrar('admin@diniz.com');
+  const lojas = (await adm('GET', '/api/lojas')).corpo;
+  const shopping = lojas.find((l) => l.nome.includes('Shopping')).id;
+
+  // Só o administrador cria supervisor, e precisa escolher as unidades
+  const dados = { nome: 'Supervisão Norte', email: 'regional@diniz.com', senha: 'senha-forte-1', perfil: 'supervisor' };
+  assert.strictEqual((await adm('POST', '/api/usuarios', dados)).status, 400);
+  const criado = await adm('POST', '/api/usuarios', { ...dados, lojas: [ids.centro, ids.aventureiro] });
+  assert.strictEqual(criado.status, 201);
+  assert.deepStrictEqual(criado.corpo.lojas, [ids.centro, ids.aventureiro].sort((a, b) => a - b));
+  const g = await entrar('centro@diniz.com');
+  assert.strictEqual((await g('POST', '/api/usuarios', { ...dados, email: 'x@diniz.com', lojas: [ids.centro] })).status, 403);
+
+  const sup = await entrar('regional@diniz.com', 'senha-forte-1');
+  const me = (await sup('GET', '/api/auth/me')).corpo;
+  assert.strictEqual(me.permissoes.varias_unidades, true);
+  assert.strictEqual(me.permissoes.integracao, false);
+  assert.strictEqual(me.permissoes.logs, false);
+  assert.deepStrictEqual((await sup('GET', '/api/lojas')).corpo.map((l) => l.id).sort(), [ids.centro, ids.aventureiro].sort());
+
+  const ags = (await sup('GET', '/api/agendamentos')).corpo;
+  assert.ok(ags.length > 0 && ags.every((a) => [ids.centro, ids.aventureiro].includes(a.loja_id)));
+  assert.strictEqual((await sup('GET', `/api/agendamentos?loja_id=${shopping}`)).status, 403);
+  const doShopping = (await adm('GET', `/api/agendamentos?loja_id=${shopping}`)).corpo[0];
+  assert.strictEqual((await sup('GET', `/api/agendamentos/${doShopping.id}`)).status, 404);
+  const rel = (await sup('GET', '/api/relatorios/resumo')).corpo;
+  assert.ok(rel.por_unidade.every((u) => [ids.centro, ids.aventureiro].includes(u.id)));
+  assert.strictEqual((await sup('GET', `/api/lojas/${shopping}/horarios`)).status, 403);
+  assert.strictEqual((await sup('GET', `/api/lojas/${ids.aventureiro}/horarios`)).status, 200);
+
+  // Sem liberação do administrador, não cria agendamento
+  assert.strictEqual((await sup('POST', '/api/agendamentos', { cliente: { nome: 'Teste' }, loja_id: ids.centro, data: '2026-11-04', hora: '10:00' })).status, 403);
+
+  // Cadastra recepção nas suas unidades, mas não em outras, e não libera agendamento
+  const rec = await sup('POST', '/api/usuarios', { nome: 'Recepção Av', email: 'rec.av@diniz.com', senha: 'senha-forte-1', perfil: 'atendente', loja_id: ids.aventureiro, pode_agendar: true });
+  assert.strictEqual(rec.status, 201);
+  assert.strictEqual(rec.corpo.pode_agendar, false);
+  assert.strictEqual((await sup('POST', '/api/usuarios', { nome: 'X', email: 'rec.sh@diniz.com', senha: 'senha-forte-1', perfil: 'atendente', loja_id: shopping })).status, 403);
+  assert.strictEqual((await sup('POST', '/api/usuarios', { nome: 'X', email: 'adm2@diniz.com', senha: 'senha-forte-1', perfil: 'admin' })).status, 403);
+  const equipe = (await sup('GET', '/api/usuarios')).corpo;
+  assert.ok(equipe.every((u) => [ids.centro, ids.aventureiro].includes(u.loja_id)));
+
+  // O administrador troca as unidades do supervisor
+  await adm('PUT', `/api/usuarios/${criado.corpo.id}`, { lojas: [shopping] });
+  assert.deepStrictEqual((await sup('GET', '/api/lojas')).corpo.map((l) => l.id), [shopping]);
+});

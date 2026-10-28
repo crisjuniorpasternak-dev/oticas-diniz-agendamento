@@ -25,12 +25,19 @@ CREATE TABLE IF NOT EXISTS usuarios (
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   senha_hash TEXT NOT NULL,
   telefone TEXT,
-  perfil TEXT NOT NULL CHECK (perfil IN ('admin','gerente','atendente')),
+  perfil TEXT NOT NULL CHECK (perfil IN ('admin','supervisor','gerente','atendente')),
   loja_id INTEGER REFERENCES lojas(id),
   pode_agendar INTEGER NOT NULL DEFAULT 0,
   principal INTEGER NOT NULL DEFAULT 0,
   ativo INTEGER NOT NULL DEFAULT 1,
   criado_em TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Unidades acompanhadas por cada supervisor
+CREATE TABLE IF NOT EXISTS usuario_lojas (
+  usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+  loja_id INTEGER NOT NULL REFERENCES lojas(id) ON DELETE CASCADE,
+  PRIMARY KEY (usuario_id, loja_id)
 );
 
 CREATE TABLE IF NOT EXISTS sessoes (
@@ -155,12 +162,32 @@ async function migrar(db) {
   }
 }
 
+// Bancos anteriores ao perfil Supervisor têm a restrição antiga em usuarios.perfil.
+// O SQLite não altera CHECK, então a tabela é recriada (procedimento oficial, numa conexão só).
+async function permitirSupervisor(cliente, db) {
+  const t = await db.get("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usuarios'");
+  if (!t || t.sql.includes("'supervisor'")) return;
+  const fk = (await db.get('PRAGMA foreign_keys'))?.foreign_keys ? 'ON' : 'OFF';
+  const nova = SCHEMA.match(/CREATE TABLE IF NOT EXISTS usuarios \(([\s\S]*?)\n\);/)[1];
+  const cols = 'id, nome, email, senha_hash, telefone, perfil, loja_id, pode_agendar, principal, ativo, criado_em';
+  await cliente.executeMultiple(`
+    PRAGMA foreign_keys = OFF;
+    BEGIN;
+    CREATE TABLE usuarios_novo (${nova}\n);
+    INSERT INTO usuarios_novo (${cols}) SELECT ${cols} FROM usuarios;
+    DROP TABLE usuarios;
+    ALTER TABLE usuarios_novo RENAME TO usuarios;
+    COMMIT;
+    PRAGMA foreign_keys = ${fk};`);
+}
+
 // url: "file:caminho.db" ou ":memory:" localmente; "libsql://..." no Turso (produção).
 async function abrir(url, authToken) {
   if (url.startsWith('file:')) fs.mkdirSync(path.dirname(url.slice(5)), { recursive: true });
   const cliente = createClient({ url, authToken });
   const db = envolver((q) => cliente.execute(q));
   await migrar(db);
+  await permitirSupervisor(cliente, db);
   await cliente.executeMultiple(SCHEMA);
   // Garante um administrador principal (o mais antigo) quando houver administradores
   if (!(await db.get("SELECT 1 FROM usuarios WHERE perfil = 'admin' AND principal = 1"))) {
@@ -245,6 +272,14 @@ async function popularDemo(db, hoje = new Date()) {
       bcrypt.hashSync(senha, 10),
       ids[0]
     );
+    // Supervisor regional que acompanha Centro e Shopping
+    const sup = (
+      await tx.run(
+        "INSERT INTO usuarios (nome, email, senha_hash, perfil, pode_agendar) VALUES ('Supervisão São Luís', 'supervisor@diniz.com', ?, 'supervisor', 1)",
+        bcrypt.hashSync(senha, 10)
+      )
+    ).lastInsertRowid;
+    for (const id of [ids[0], ids[2]]) await tx.run('INSERT INTO usuario_lojas (usuario_id, loja_id) VALUES (?,?)', sup, id);
 
     const nomes = ['Ana Souza', 'Bruno Lima', 'Carla Mendes', 'Diego Rocha', 'Elaine Castro', 'Fábio Nunes', 'Gabriela Pires', 'Henrique Alves'];
     const cli = [];

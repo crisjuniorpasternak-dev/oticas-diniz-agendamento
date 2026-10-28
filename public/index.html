@@ -6,6 +6,10 @@
   <title>Óticas Diniz · Agendamentos</title>
   <meta name="theme-color" content="#c8102e">
   <meta name="color-scheme" content="light dark">
+  <script>
+    // Aplica o tema escolhido antes de desenhar a página (evita piscar)
+    try { const t = localStorage.getItem('tema'); if (t) document.documentElement.dataset.tema = t; } catch {}
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400..800&display=swap">

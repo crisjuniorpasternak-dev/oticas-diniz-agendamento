@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const { criarUnidade, configuracao, definirConfiguracao, novoToken } = require('./db');
-const { PERFIS, ehAdmin, ehPrincipal, podeAgendar, perfisGerenciaveis, permissoes } = require('./permissoes');
+const { PERFIS, ehAdmin, ehPrincipal, ehSupervisor, variasUnidades, gerencia, podeAgendar, perfisGerenciaveis, permissoes } = require('./permissoes');
 const agenda = require('./agenda');
 const integracao = require('./integracao');
 
@@ -58,6 +58,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
       perfil: u.perfil,
       perfil_rotulo: ehPrincipal(u) ? 'Administrador principal' : PERFIS[u.perfil]?.rotulo,
       loja_id: u.loja_id,
+      lojas: u.lojas ?? undefined,
       pode_agendar: podeAgendar(u),
       principal: !!u.principal,
       ativo: !!u.ativo,
@@ -73,10 +74,18 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
          WHERE s.token = ? AND s.expira_em > datetime('now') AND u.ativo = 1`,
         token
       );
-      if (u) req.usuario = u;
+      if (u) req.usuario = await comUnidades(u);
     }
     next();
   });
+
+  // Unidades que o usuário enxerga: null = todas (administrador)
+  async function comUnidades(u) {
+    if (ehAdmin(u)) u.lojas = null;
+    else if (ehSupervisor(u)) u.lojas = (await db.all('SELECT loja_id FROM usuario_lojas WHERE usuario_id = ? ORDER BY loja_id', u.id)).map((x) => x.loja_id);
+    else u.lojas = u.loja_id ? [u.loja_id] : [];
+    return u;
+  }
 
   const exigirLogin = (req, res, next) => (req.usuario ? next() : res.status(401).json({ erro: 'Faça login para continuar.' }));
   const exigir = (permissao) => [
@@ -115,7 +124,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     await db.run("DELETE FROM sessoes WHERE expira_em <= datetime('now')");
     await abrirSessao(res, u.id);
     await auditar(u.id, 'login', 'usuario', u.id);
-    res.json({ usuario: usuarioPublico(u), permissoes: permissoes(u) });
+    res.json({ usuario: usuarioPublico(await comUnidades(u)), permissoes: permissoes(u) });
   });
 
   app.post('/api/auth/logout', async (req, res) => {
@@ -147,22 +156,42 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     }
     await db.run('UPDATE usuarios SET nome = ?, telefone = ?, senha_hash = ? WHERE id = ?', nome, telefone, hash, u.id);
     await auditar(u.id, 'editar_perfil', 'usuario', u.id);
-    res.json({ usuario: usuarioPublico(await db.get('SELECT * FROM usuarios WHERE id = ?', u.id)) });
+    res.json({ usuario: usuarioPublico(await comUnidades(await db.get('SELECT * FROM usuarios WHERE id = ?', u.id))) });
   });
 
   app.get('/api/saude', (req, res) => res.json({ ok: true }));
 
   // ---------- Escopo por unidade ----------
-  // Administrador escolhe a unidade (ou todas); os demais ficam presos à sua.
-  const lojaDoEscopo = (u, lojaPedida) => (ehAdmin(u) ? (lojaPedida ? Number(lojaPedida) : null) : u.loja_id);
+  // Administrador vê todas; supervisor, as unidades dele; os demais, só a sua.
+  const podeLoja = (u, lojaId) => u.lojas === null || u.lojas.includes(Number(lojaId));
   const garantirLoja = (u, lojaId) => {
-    if (!ehAdmin(u) && Number(lojaId) !== u.loja_id) falha(403, 'Você só tem acesso à sua unidade.');
+    if (!podeLoja(u, lojaId)) falha(403, 'Você não tem acesso a esta unidade.');
+  };
+  // Condição SQL das unidades visíveis, opcionalmente limitada à unidade pedida
+  // (quem só tem uma unidade ignora a unidade pedida e fica na sua)
+  const condLojas = (u, coluna, lojaPedida) => {
+    if (lojaPedida && variasUnidades(u)) {
+      garantirLoja(u, lojaPedida);
+      return [`${coluna} = ?`, [Number(lojaPedida)]];
+    }
+    if (u.lojas === null) return ['1=1', []];
+    if (!u.lojas.length) return ['0', []];
+    return [`${coluna} IN (${u.lojas.map(() => '?').join(',')})`, [...u.lojas]];
+  };
+  // Unidade de um cadastro: quem vê várias escolhe; os demais usam a sua
+  const lojaInformada = (u, lojaId) => {
+    const id = variasUnidades(u) ? Number(lojaId) : u.loja_id;
+    if (id) garantirLoja(u, id);
+    return id;
   };
 
   // ---------- Unidades ----------
   app.get('/api/lojas', exigirLogin, async (req, res) => {
     const u = req.usuario;
-    if (!ehAdmin(u)) return res.json(await db.all('SELECT * FROM lojas WHERE id = ?', u.loja_id));
+    if (!ehAdmin(u)) {
+      const [cond, p] = condLojas(u, 'id');
+      return res.json(await db.all(`SELECT * FROM lojas WHERE ${cond} ${ehSupervisor(u) ? 'AND ativa = 1' : ''} ORDER BY nome`, ...p));
+    }
     const todas = req.query.todas === '1';
     res.json(await db.all(`SELECT * FROM lojas ${todas ? '' : 'WHERE ativa = 1'} ORDER BY nome`));
   });
@@ -257,18 +286,19 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
   });
 
   app.get('/api/bloqueios', exigir('horarios'), async (req, res) => {
-    const lojaId = lojaDoEscopo(req.usuario, req.query.loja_id);
+    const [cond, p] = condLojas(req.usuario, 'b.loja_id', req.query.loja_id);
     res.json(
       await db.all(
         `SELECT b.*, l.nome AS loja_nome FROM bloqueios_loja b JOIN lojas l ON l.id = b.loja_id
-         WHERE b.data >= ? ${lojaId ? 'AND b.loja_id = ?' : ''} ORDER BY b.data, b.hora_inicio`,
-        ...[agenda.hojeISO(agora()), lojaId].filter((v) => v !== null)
+         WHERE b.data >= ? AND ${cond} ORDER BY b.data, b.hora_inicio`,
+        agenda.hojeISO(agora()),
+        ...p
       )
     );
   });
 
   app.post('/api/bloqueios', exigir('horarios'), async (req, res) => {
-    const lojaId = ehAdmin(req.usuario) ? Number(req.body.loja_id) : req.usuario.loja_id;
+    const lojaId = lojaInformada(req.usuario, req.body.loja_id);
     if (!(await db.get('SELECT 1 FROM lojas WHERE id = ?', lojaId))) falha(400, 'Escolha a unidade.');
     const { data } = req.body;
     const hi = req.body.hora_inicio || '00:00';
@@ -289,7 +319,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
 
   app.delete('/api/bloqueios/:id', exigir('horarios'), async (req, res) => {
     const b = await db.get('SELECT * FROM bloqueios_loja WHERE id = ?', Number(req.params.id));
-    if (!b || (!ehAdmin(req.usuario) && b.loja_id !== req.usuario.loja_id)) falha(404, 'Bloqueio não encontrado.');
+    if (!b || !podeLoja(req.usuario, b.loja_id)) falha(404, 'Bloqueio não encontrado.');
     await db.run('DELETE FROM bloqueios_loja WHERE id = ?', b.id);
     await auditar(req.usuario.id, 'excluir', 'bloqueio', b.id, b);
     res.json({ ok: true });
@@ -298,18 +328,18 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
   // ---------- Usuários ----------
   // Usuário alvo está no escopo de quem o gerencia?
   const noEscopo = (eu, alvo) =>
-    perfisGerenciaveis(eu).includes(alvo.perfil) && (ehAdmin(eu) || alvo.loja_id === eu.loja_id);
+    perfisGerenciaveis(eu).includes(alvo.perfil) && (ehAdmin(eu) || (alvo.loja_id && podeLoja(eu, alvo.loja_id)));
 
   app.get('/api/usuarios', exigir('usuarios'), async (req, res) => {
     const eu = req.usuario;
     const f = [];
     const p = [];
-    if (!ehAdmin(eu)) {
-      f.push('loja_id = ?');
-      p.push(eu.loja_id);
-    } else if (req.query.loja_id) {
-      f.push('loja_id = ?');
-      p.push(Number(req.query.loja_id));
+    if (!ehAdmin(eu) || req.query.loja_id) {
+      const [cond, pl] = condLojas(eu, 'loja_id', req.query.loja_id);
+      // Supervisores das unidades filtradas aparecem junto (só para o administrador)
+      const sup = ehAdmin(eu) ? ` OR id IN (SELECT usuario_id FROM usuario_lojas WHERE loja_id = ?)` : '';
+      f.push(`(${cond}${sup})`);
+      p.push(...pl, ...(sup ? [Number(req.query.loja_id)] : []));
     }
     if (req.query.perfil) {
       f.push('perfil = ?');
@@ -323,15 +353,30 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
       `SELECT * FROM usuarios ${f.length ? 'WHERE ' + f.join(' AND ') : ''} ORDER BY perfil = 'admin' DESC, nome LIMIT 500`,
       ...p
     );
+    const vinculos = await db.all('SELECT usuario_id, loja_id FROM usuario_lojas ORDER BY loja_id');
+    for (const u of lista) if (ehSupervisor(u)) u.lojas = vinculos.filter((v) => v.usuario_id === u.id).map((v) => v.loja_id);
     res.json(lista.map((u) => ({ ...usuarioPublico(u), editavel: u.id !== eu.id && noEscopo(eu, u) })));
   });
 
   const resolverLoja = async (eu, perfil, lojaId) => {
-    if (perfil === 'admin') return null;
-    const id = ehAdmin(eu) ? Number(lojaId) : eu.loja_id;
+    if (perfil === 'admin' || perfil === 'supervisor') return null;
+    const id = lojaInformada(eu, lojaId);
     if (!id || !(await db.get('SELECT 1 FROM lojas WHERE id = ?', id))) falha(400, 'Escolha a unidade deste usuário.');
     return id;
   };
+  // Unidades acompanhadas pelo supervisor (só o administrador define)
+  const resolverUnidades = async (lojas) => {
+    const ids = [...new Set((Array.isArray(lojas) ? lojas : []).map(Number).filter(Boolean))];
+    if (!ids.length) falha(400, 'Escolha ao menos uma unidade para o supervisor.');
+    const existem = await db.all(`SELECT id FROM lojas WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids);
+    if (existem.length !== ids.length) falha(400, 'Unidade inválida na lista do supervisor.');
+    return ids;
+  };
+  const gravarUnidades = async (usuarioId, ids) => {
+    await db.run('DELETE FROM usuario_lojas WHERE usuario_id = ?', usuarioId);
+    for (const id of ids) await db.run('INSERT INTO usuario_lojas (usuario_id, loja_id) VALUES (?,?)', usuarioId, id);
+  };
+  const publicoCompleto = async (id) => usuarioPublico(await comUnidades(await db.get('SELECT * FROM usuarios WHERE id = ?', id)));
 
   app.post('/api/usuarios', exigir('usuarios'), async (req, res) => {
     const eu = req.usuario;
@@ -342,6 +387,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     const senha = validarSenha(req.body.senha);
     if (await db.get('SELECT 1 FROM usuarios WHERE email = ?', email)) falha(409, 'Já existe um usuário com este e-mail.');
     const lojaId = await resolverLoja(eu, perfil, req.body.loja_id);
+    const unidades = perfil === 'supervisor' ? await resolverUnidades(req.body.lojas) : null;
     const pode = ehAdmin(eu) ? !!req.body.pode_agendar : false;
     const id = (
       await db.run(
@@ -349,8 +395,9 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
         nome, email, bcrypt.hashSync(senha, 10), req.body.telefone || null, perfil, lojaId, pode ? 1 : 0
       )
     ).lastInsertRowid;
-    await auditar(eu.id, 'criar', 'usuario', id, { perfil, loja_id: lojaId, pode_agendar: pode });
-    res.status(201).json(usuarioPublico(await db.get('SELECT * FROM usuarios WHERE id = ?', id)));
+    if (unidades) await gravarUnidades(id, unidades);
+    await auditar(eu.id, 'criar', 'usuario', id, { perfil, loja_id: lojaId, lojas: unidades ?? undefined, pode_agendar: pode });
+    res.status(201).json(await publicoCompleto(id));
   });
 
   app.put('/api/usuarios/:id', exigir('usuarios'), async (req, res) => {
@@ -364,6 +411,8 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     const email = validarEmail(req.body.email ?? alvo.email);
     if (await db.get('SELECT 1 FROM usuarios WHERE email = ? AND id <> ?', email, alvo.id)) falha(409, 'Já existe um usuário com este e-mail.');
     const lojaId = await resolverLoja(eu, perfil, req.body.loja_id ?? alvo.loja_id);
+    const unidades =
+      perfil !== 'supervisor' ? [] : req.body.lojas !== undefined || alvo.perfil !== 'supervisor' ? await resolverUnidades(req.body.lojas) : null;
     const ativo = req.body.ativo === undefined ? alvo.ativo : req.body.ativo ? 1 : 0;
     const pode = ehAdmin(eu) && req.body.pode_agendar !== undefined ? (req.body.pode_agendar ? 1 : 0) : alvo.pode_agendar;
     const hash = req.body.senha ? bcrypt.hashSync(validarSenha(req.body.senha), 10) : alvo.senha_hash;
@@ -371,10 +420,11 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
       'UPDATE usuarios SET nome=?, email=?, telefone=?, perfil=?, loja_id=?, pode_agendar=?, ativo=?, senha_hash=? WHERE id=?',
       nome, email, req.body.telefone ?? alvo.telefone, perfil, lojaId, pode, ativo, hash, alvo.id
     );
+    if (unidades) await gravarUnidades(alvo.id, unidades);
     if (!ativo || req.body.senha) await db.run('DELETE FROM sessoes WHERE usuario_id = ?', alvo.id);
     const { senha, ...semSenha } = req.body;
     await auditar(eu.id, 'editar', 'usuario', alvo.id, { ...semSenha, senha_alterada: !!senha });
-    res.json(usuarioPublico(await db.get('SELECT * FROM usuarios WHERE id = ?', alvo.id)));
+    res.json(await publicoCompleto(alvo.id));
   });
 
   // ---------- Clientes ----------
@@ -433,7 +483,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     FROM agendamentos a JOIN lojas l ON l.id = a.loja_id JOIN clientes c ON c.id = a.cliente_id
     LEFT JOIN usuarios u ON u.id = a.criado_por`;
 
-  const escopo = (eu) => (ehAdmin(eu) ? ['1=1', []] : ['a.loja_id = ?', [eu.loja_id]]);
+  const escopo = (eu) => condLojas(eu, 'a.loja_id');
 
   async function buscarAgendamento(eu, id) {
     const [cond, p] = escopo(eu);
@@ -454,7 +504,10 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     const params = [...p];
     if (q.data_inicio) f.push('a.data >= ?') && params.push(q.data_inicio);
     if (q.data_fim) f.push('a.data <= ?') && params.push(q.data_fim);
-    if (q.loja_id && ehAdmin(eu)) f.push('a.loja_id = ?') && params.push(Number(q.loja_id));
+    if (q.loja_id && variasUnidades(eu)) {
+      garantirLoja(eu, q.loja_id);
+      f.push('a.loja_id = ?') && params.push(Number(q.loja_id));
+    }
     if (q.origem) f.push('a.origem = ?') && params.push(q.origem);
     if (q.status) {
       const sts = String(q.status).split(',').filter((s) => STATUS.includes(s));
@@ -494,11 +547,11 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
 
   app.post('/api/agendamentos', exigirAgendar, async (req, res) => {
     const eu = req.usuario;
-    const lojaId = ehAdmin(eu) ? Number(req.body.loja_id) : eu.loja_id;
+    const lojaId = lojaInformada(eu, req.body.loja_id);
     if (!(await db.get('SELECT 1 FROM lojas WHERE id = ? AND ativa = 1', lojaId))) falha(400, 'Escolha a unidade.');
     const { data, hora } = req.body;
     if (!agenda.dataValida(data) || !agenda.horaValida(hora)) falha(400, 'Escolha data e horário.');
-    const encaixe = !!req.body.encaixe && (ehAdmin(eu) || eu.perfil === 'gerente');
+    const encaixe = !!req.body.encaixe && gerencia(eu);
 
     const id = await db.transacao(async (tx) => {
       const clienteId = req.body.cliente_id
@@ -538,7 +591,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     compareceu: { de: ['agendado', 'confirmado', 'faltou'], pode: () => true },
     faltou: { de: ['agendado', 'confirmado', 'compareceu'], pode: () => true },
     cancelado: { de: ['agendado', 'confirmado'], pode: podeAgendar },
-    agendado: { de: ['compareceu', 'faltou', 'cancelado'], pode: (u) => ehAdmin(u) || u.perfil === 'gerente' },
+    agendado: { de: ['compareceu', 'faltou', 'cancelado'], pode: (u) => gerencia(u) },
   };
 
   app.patch('/api/agendamentos/:id/status', exigirLogin, async (req, res) => {
@@ -566,7 +619,7 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     if (!['agendado', 'confirmado'].includes(ag.status)) falha(409, 'Só agendamentos em aberto podem ser remarcados.');
     const { data, hora } = req.body;
     if (!agenda.dataValida(data) || !agenda.horaValida(hora)) falha(400, 'Escolha data e horário.');
-    const encaixe = !!req.body.encaixe && (ehAdmin(eu) || eu.perfil === 'gerente');
+    const encaixe = !!req.body.encaixe && gerencia(eu);
     await db.transacao(async (tx) => {
       if (!encaixe) {
         const livres = await agenda.horariosLivres(tx, { lojaId: ag.loja_id, data, ignorarAgendamentoId: ag.id, agora: agora() });
@@ -586,13 +639,13 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     const hoje = agenda.hojeISO(agora());
     const inicio = agenda.dataValida(req.query.inicio) ? req.query.inicio : agenda.somarDias(hoje, -30);
     const fim = agenda.dataValida(req.query.fim) ? req.query.fim : hoje;
-    const lojaId = lojaDoEscopo(eu, req.query.loja_id);
-    const filtro = `a.data BETWEEN ? AND ? ${lojaId ? 'AND a.loja_id = ?' : ''}`;
-    const p = lojaId ? [inicio, fim, lojaId] : [inicio, fim];
+    const [cond, pl] = condLojas(eu, 'a.loja_id', req.query.loja_id);
+    const filtro = `a.data BETWEEN ? AND ? AND ${cond}`;
+    const p = [inicio, fim, ...pl];
     res.json({
       inicio,
       fim,
-      loja_id: lojaId,
+      loja_id: variasUnidades(eu) ? (req.query.loja_id ? Number(req.query.loja_id) : null) : eu.loja_id,
       geral: await db.get(`SELECT ${SOMAS} FROM agendamentos a WHERE ${filtro}`, ...p),
       por_unidade: await db.all(
         `SELECT l.id, l.nome, ${SOMAS} FROM agendamentos a JOIN lojas l ON l.id = a.loja_id WHERE ${filtro} GROUP BY l.id ORDER BY total DESC`,

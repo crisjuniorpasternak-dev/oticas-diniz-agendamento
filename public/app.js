@@ -25,6 +25,8 @@ const ICONES = {
   unidades: '<path d="M12 21s-7-5.6-7-11.5a7 7 0 0 1 14 0C19 15.4 12 21 12 21Z"/><circle cx="12" cy="9.5" r="2.5"/>',
   sair: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H3"/>',
   ok: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  sol: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  lua: '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/>',
   vazio: '<rect x="3" y="4.5" width="18" height="16.5" rx="2"/><path d="M3 9.5h18M8 3v3M16 3v3M9.5 14.5l5 3M14.5 14.5l-5 3"/>',
   anterior: '<path d="m15 6-6 6 6 6"/>',
   falta: '<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/>',
@@ -130,13 +132,30 @@ const lembrar = (k) => {
   }
 };
 
+// ---------- Tema (fundo branco ou escuro) ----------
+const temaAtual = () =>
+  document.documentElement.dataset.tema || (matchMedia('(prefers-color-scheme: dark)').matches ? 'escuro' : 'claro');
+const botaoTema = () =>
+  `<button class="botao-tema" data-tema-alternar title="${temaAtual() === 'escuro' ? 'Usar fundo branco' : 'Usar fundo escuro'}" aria-label="Alternar fundo branco ou escuro">${icone(temaAtual() === 'escuro' ? 'sol' : 'lua')}</button>`;
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-tema-alternar]');
+  if (!b) return;
+  const novo = temaAtual() === 'escuro' ? 'claro' : 'escuro';
+  document.documentElement.dataset.tema = novo;
+  guardar('tema', novo);
+  $$('[data-tema-alternar]').forEach((x) => (x.outerHTML = botaoTema()));
+});
+
 // ---------- Estado e navegação ----------
 const estado = { usuario: null, loja: null, permissoes: {}, lojas: [], unidade: null };
 const pode = (p) => !!estado.permissoes[p];
 const ehAdmin = () => estado.usuario?.perfil === 'admin';
 const nomeLoja = (id) => estado.lojas.find((l) => l.id === id)?.nome || '—';
 // Unidade em foco: a do usuário, ou a escolhida pelo administrador ('' = todas)
-const unidadeAtual = () => (ehAdmin() ? estado.unidade || '' : estado.usuario.loja_id);
+// Administrador e supervisor escolhem a unidade no topo; os demais ficam na sua
+const variasUnidades = () => pode('varias_unidades');
+const rotuloTodas = () => (ehAdmin() ? 'Todas as unidades' : 'Todas as minhas unidades');
+const unidadeAtual = () => (variasUnidades() ? estado.unidade || '' : estado.usuario.loja_id);
 const filtroUnidade = () => (unidadeAtual() ? `loja_id=${unidadeAtual()}` : '');
 
 function menu() {
@@ -152,10 +171,10 @@ const TELAS = {};
 
 function rotaAtual() {
   const [r, sub] = (location.hash.replace('#/', '') || '').split('/');
-  if (r === 'unidades' && ehAdmin()) return ['unidades'];
+  if (r === 'unidades' && variasUnidades()) return ['unidades'];
   if (r === 'perfil') return ['perfil'];
   if (menu().some(([id]) => id === r)) return [r, sub];
-  return [ehAdmin() && lembrar('unidade') === null ? 'unidades' : 'inicio'];
+  return [variasUnidades() && lembrar('unidade') === null ? 'unidades' : 'inicio'];
 }
 
 async function iniciar() {
@@ -168,7 +187,7 @@ async function iniciar() {
   Object.assign(estado, { usuario: me.usuario, loja: me.loja, permissoes: me.permissoes });
   estado.lojas = await api('GET', '/api/lojas');
   const salva = lembrar('unidade');
-  estado.unidade = ehAdmin() && salva && estado.lojas.some((l) => String(l.id) === salva) ? Number(salva) : null;
+  estado.unidade = variasUnidades() && salva && estado.lojas.some((l) => String(l.id) === salva) ? Number(salva) : null;
   renderizar();
 }
 
@@ -178,7 +197,7 @@ function renderizar() {
   const m = Object.fromEntries(menu().map((x) => [x[0], x]));
   const secoes = [
     ['', [m.inicio]],
-    ['Agenda', [m.agendamentos, m.novo, ehAdmin() && ['unidades', 'Unidades', 'Unidades']]],
+    ['Agenda', [m.agendamentos, m.novo, variasUnidades() && ['unidades', 'Unidades', 'Unidades']]],
     ['Gestão', [m.relatorios, pode('integracao') && ['configuracoes/integracao', 'Integrações', 'CRM', 'webhook'], m.configuracoes]],
   ].map(([t, l]) => [t, l.filter(Boolean)]);
   const atual = rota === 'configuracoes' && sub === 'integracao' ? 'configuracoes/integracao' : rota;
@@ -204,14 +223,15 @@ function renderizar() {
         <header class="barra">
           <a href="#/inicio" class="logo-celular" aria-label="Início">${logo}</a>
           <div class="seletor-unidade">${icone('unidades')}${
-            ehAdmin()
+            variasUnidades()
               ? `<select id="unidade" aria-label="Unidade">
-                  <option value="">Todas as unidades</option>
+                  <option value="">${rotuloTodas()}</option>
                   ${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === estado.unidade ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}
                 </select>`
               : `<span>${esc(estado.loja?.nome || '')}</span>`
           }</div>
           <div class="espaco"></div>
+          ${botaoTema()}
           <span class="pilula data-hoje">${icone('agendamentos')} ${diaSemana(hoje())}, ${dataBR(hoje())}</span>
           <a href="#/perfil" class="usuario" title="Meu perfil"><span class="nome"><b>${esc(u.nome)}</b><small>${esc(u.perfil_rotulo)}</small></span><span class="avatar">${esc(iniciais(u.nome))}</span></a>
         </header>
@@ -253,6 +273,7 @@ function telaEntrada() {
         <div><h1>Agendamentos de exame de vista</h1><p>Acompanhe quem foi agendado, quem compareceu e quem faltou em cada unidade.</p></div>
       </section>
       <section class="formulario">
+        <div class="tema-entrada">${botaoTema()}</div>
         <form id="f">
           <h2 style="font-size:1.4rem">Entrar</h2>
           <p class="suave" style="margin-top:-6px;margin-bottom:24px">Use o e-mail e a senha da sua unidade.</p>
@@ -264,7 +285,7 @@ function telaEntrada() {
             estado.demo
               ? `<div class="demo"><b>Acessos de demonstração</b> (senha <code>diniz123</code>):<br>
                  <code>admin@diniz.com</code> · <code>centro@diniz.com</code><br>
-                 <code>aventureiro@diniz.com</code> · <code>recepcao.centro@diniz.com</code></div>`
+                 <code>aventureiro@diniz.com</code> · <code>recepcao.centro@diniz.com</code><br><code>supervisor@diniz.com</code></div>`
               : ''
           }
         </form>
@@ -289,7 +310,7 @@ TELAS.unidades = async (el) => {
   el.innerHTML = `
     <div class="cabeca"><div><h1>Selecione a unidade</h1><p class="suave">Agendamentos de hoje, ${diaSemana(hoje()).toLowerCase()} ${dataBR(hoje())}</p></div></div>
     <div class="unidades">
-      <button class="unidade todas" data-u=""><span class="topo-cartao"><span class="pino">${icone('inicio')}</span><span><b>Todas as unidades</b><span class="suave">${estado.lojas.length} unidade(s)</span></span></span>
+      <button class="unidade todas" data-u=""><span class="topo-cartao"><span class="pino">${icone('inicio')}</span><span><b>${rotuloTodas()}</b><span class="suave">${estado.lojas.length} unidade(s)</span></span></span>
         <span class="num">${total}</span><span class="suave">agendamentos hoje</span></button>
       ${estado.lojas
         .map((l, i) => {
@@ -338,7 +359,7 @@ function grafico(dias, por) {
 
 TELAS.inicio = async (el) => {
   const st = (TELAS.inicio.st ||= { mes: hoje().slice(0, 7), dia: hoje(), aba: '' });
-  const tituloUnidade = unidadeAtual() ? nomeLoja(unidadeAtual()) : 'Todas as unidades';
+  const tituloUnidade = unidadeAtual() ? nomeLoja(unidadeAtual()) : rotuloTodas();
   const inicio30 = somarDias(hoje(), -29);
   el.innerHTML = `
     <div class="cabeca"><div><h1>${esc(tituloUnidade)}</h1><p class="suave">Hoje é ${diaSemana(hoje()).toLowerCase()}, ${dataBR(hoje())}</p></div>
@@ -531,7 +552,7 @@ function ligarTabela(raiz, lista, aoMudar) {
 
 // Ações possíveis para o usuário, conforme o status atual
 function acoesPara(a) {
-  const gerencia = ehAdmin() || estado.usuario.perfil === 'gerente';
+  const gerencia = variasUnidades() || estado.usuario.perfil === 'gerente';
   const aberto = ['agendado', 'confirmado'].includes(a.status);
   const r = [];
   if (a.status === 'agendado') r.push(['confirmado', 'Confirmar', 'btn sec']);
@@ -581,7 +602,7 @@ async function detalheAgendamento(id, aoMudar) {
 
 // Seletor de data + horários livres (agendar e remarcar)
 function seletorHorario(cont, { lojaId, aoEscolher }) {
-  const encaixe = ehAdmin() || estado.usuario.perfil === 'gerente';
+  const encaixe = variasUnidades() || estado.usuario.perfil === 'gerente';
   cont.innerHTML = `
     <div class="linha">
       <label>Data<input type="date" id="sh-data" min="${hoje()}" value="${hoje()}"></label>
@@ -705,7 +726,7 @@ TELAS.novo = (el) => {
     <div class="cabeca"><div><h1>Novo agendamento</h1><p class="suave">Escolha o cliente, o dia e o horário</p></div></div>
     <div class="cartao" style="max-width:820px">
       ${
-        ehAdmin()
+        variasUnidades()
           ? `<label>Unidade<select id="n-loja"><option value="">Escolha a unidade</option>${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === st.loja ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}</select></label>`
           : ''
       }
@@ -927,21 +948,28 @@ function formUnidade(l, aoSalvar) {
 }
 
 // Usuários
-const ROTULOS = { admin: 'Administrador', gerente: 'Gerente da unidade', atendente: 'Recepção' };
-const perfisPermitidos = () => (estado.usuario.principal ? ['admin', 'gerente', 'atendente'] : ehAdmin() ? ['gerente', 'atendente'] : ['atendente']);
+const ROTULOS = { admin: 'Administrador', supervisor: 'Supervisor', gerente: 'Gerente da unidade', atendente: 'Recepção' };
+const perfisPermitidos = () =>
+  estado.usuario.principal
+    ? ['admin', 'supervisor', 'gerente', 'atendente']
+    : ehAdmin()
+      ? ['supervisor', 'gerente', 'atendente']
+      : estado.usuario.perfil === 'supervisor'
+        ? ['gerente', 'atendente']
+        : ['atendente'];
 
 CONFIG.usuarios = async (el) => {
-  const q = unidadeAtual() && ehAdmin() ? `?loja_id=${unidadeAtual()}` : '';
+  const q = unidadeAtual() && variasUnidades() ? `?loja_id=${unidadeAtual()}` : '';
   const lista = await api('GET', '/api/usuarios' + q);
   el.innerHTML = `
     <div class="cartao tabela-rolagem">
-      <div class="cabeca"><p class="suave" style="margin:0">${ehAdmin() ? 'Defina quem é administrador, gerente ou recepção de cada unidade, e quem pode criar agendamentos.' : 'Responsáveis pela sua unidade.'}</p>
+      <div class="cabeca"><p class="suave" style="margin:0">${ehAdmin() ? 'Defina quem é administrador, supervisor, gerente ou recepção, e quem pode criar agendamentos.' : variasUnidades() ? 'Gerentes e recepção das suas unidades.' : 'Responsáveis pela sua unidade.'}</p>
         <button class="btn" id="novo">+ Novo usuário</button></div>
       <table><thead><tr><th>Nome</th><th class="esconder-celular">E-mail</th><th>Perfil</th><th>Unidade</th><th>Pode agendar</th><th>Situação</th></tr></thead>
       <tbody>${lista
         .map(
           (u) => `<tr class="${u.editavel ? 'clicavel' : ''} ${u.ativo ? '' : 'inativo'}" data-id="${u.id}"><td><b>${esc(u.nome)}</b></td>
-          <td class="esconder-celular">${esc(u.email)}</td><td>${esc(u.perfil_rotulo)}</td><td>${u.loja_id ? esc(nomeLoja(u.loja_id)) : 'Todas'}</td>
+          <td class="esconder-celular">${esc(u.email)}</td><td>${esc(u.perfil_rotulo)}</td><td>${u.perfil === 'supervisor' ? esc((u.lojas || []).map(nomeLoja).join(', ')) : u.loja_id ? esc(nomeLoja(u.loja_id)) : 'Todas'}</td>
           <td>${ehAdmin() && u.editavel && u.perfil !== 'admin' ? `<label class="check" style="margin:0"><input type="checkbox" data-pode="${u.id}" ${u.pode_agendar ? 'checked' : ''}> ${u.pode_agendar ? 'Sim' : 'Não'}</label>` : u.pode_agendar ? 'Sim' : 'Não'}</td>
           <td>${u.ativo ? 'Ativo' : 'Inativo'}</td></tr>`
         )
@@ -975,8 +1003,11 @@ function formUsuario(u, aoSalvar) {
       <label>Telefone<input name="telefone" value="${esc(u.telefone || '')}"></label></div>
       <div class="linha">
         <label>Perfil<select name="perfil">${perfis.map((p) => `<option value="${p}" ${p === u.perfil ? 'selected' : ''}>${ROTULOS[p]}</option>`).join('')}</select></label>
-        ${ehAdmin() ? `<label id="campo-loja">Unidade<select name="loja_id"><option value="">—</option>${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === u.loja_id ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}</select></label>` : ''}
+        ${variasUnidades() ? `<label id="campo-loja">Unidade<select name="loja_id"><option value="">—</option>${estado.lojas.map((l) => `<option value="${l.id}" ${l.id === u.loja_id ? 'selected' : ''}>${esc(l.nome)}</option>`).join('')}</select></label>` : ''}
       </div>
+      ${ehAdmin() ? `<fieldset class="unidades-sup" id="campo-lojas"><legend>Unidades que o supervisor acompanha</legend>${estado.lojas
+        .map((l) => `<label class="check"><input type="checkbox" data-sup="${l.id}" ${(u.lojas || []).includes(l.id) ? 'checked' : ''}> ${esc(l.nome)}</label>`)
+        .join('')}</fieldset>` : ''}
       ${ehAdmin() ? `<label class="check" id="campo-pode"><input type="checkbox" name="pode_agendar" ${u.pode_agendar ? 'checked' : ''}> Pode criar, remarcar e cancelar agendamentos</label>` : ''}
       <label>${novo ? 'Senha inicial (mín. 8)' : 'Nova senha (em branco mantém a atual)'}<input name="senha" type="password" minlength="8" ${novo ? 'required' : ''} autocomplete="new-password"></label>
       ${!novo ? `<label class="check"><input type="checkbox" name="ativo" ${u.ativo ? 'checked' : ''}> Acesso ativo</label>` : ''}
@@ -985,9 +1016,10 @@ function formUsuario(u, aoSalvar) {
     </form>`);
   const f = $('#fu', m);
   const ajustar = () => {
-    const admin = $('[name=perfil]', f).value === 'admin';
-    if ($('#campo-loja', f)) $('#campo-loja', f).hidden = admin;
-    if ($('#campo-pode', f)) $('#campo-pode', f).hidden = admin;
+    const perfil = $('[name=perfil]', f).value;
+    if ($('#campo-loja', f)) $('#campo-loja', f).hidden = perfil === 'admin' || perfil === 'supervisor';
+    if ($('#campo-lojas', f)) $('#campo-lojas', f).hidden = perfil !== 'supervisor';
+    if ($('#campo-pode', f)) $('#campo-pode', f).hidden = perfil === 'admin';
   };
   $('[name=perfil]', f).onchange = ajustar;
   ajustar();
@@ -996,6 +1028,7 @@ function formUsuario(u, aoSalvar) {
     tentar(f, async () => {
       const d = dadosForm(f);
       if (ehAdmin()) d.pode_agendar = !!$('[name=pode_agendar]', f).checked;
+      if (d.perfil === 'supervisor') d.lojas = $$('[data-sup]:checked', f).map((c) => Number(c.dataset.sup));
       if (!novo) d.ativo = !!$('[name=ativo]', f).checked;
       if (!d.senha) delete d.senha;
       await api(novo ? 'POST' : 'PUT', novo ? '/api/usuarios' : `/api/usuarios/${u.id}`, d);
@@ -1013,7 +1046,7 @@ CONFIG.horarios = async (el) => {
   const [{ loja, horarios }, bloqueios] = await Promise.all([api('GET', `/api/lojas/${lojaId}/horarios`), api('GET', `/api/bloqueios?loja_id=${lojaId}`)]);
   const doDia = (d) => horarios.find((h) => h.dia_semana === d);
   el.innerHTML = `
-    ${ehAdmin() && !unidadeAtual() ? `<p class="suave">Mostrando <b>${esc(loja.nome)}</b>. Escolha outra unidade no topo da página.</p>` : ''}
+    ${variasUnidades() && !unidadeAtual() ? `<p class="suave">Mostrando <b>${esc(loja.nome)}</b>. Escolha outra unidade no topo da página.</p>` : ''}
     <div class="cartao">
       <h2>Horário de atendimento · ${esc(loja.nome)}</h2>
       <form id="fh">
