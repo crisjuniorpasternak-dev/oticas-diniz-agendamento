@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS lojas (
   hora_fechamento TEXT NOT NULL DEFAULT '18:00',
   duracao_consulta INTEGER NOT NULL DEFAULT 30,
   vagas_por_horario INTEGER NOT NULL DEFAULT 1,
+  meta_diaria REAL,
+  chave_pix TEXT,
   ativa INTEGER NOT NULL DEFAULT 1,
   criado_em TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -95,6 +97,33 @@ CREATE TABLE IF NOT EXISTS agendamentos (
 CREATE INDEX IF NOT EXISTS idx_ag_loja_data ON agendamentos(loja_id, data);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ag_externo ON agendamentos(origem, id_externo) WHERE id_externo IS NOT NULL;
 
+-- Fechamento diário da unidade (preenchido pela gerente, no modelo da planilha)
+CREATE TABLE IF NOT EXISTS fechamentos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loja_id INTEGER NOT NULL REFERENCES lojas(id),
+  data TEXT NOT NULL,
+  opto TEXT,
+  observacoes TEXT,
+  meta REAL,
+  atualizado_por INTEGER REFERENCES usuarios(id),
+  criado_em TEXT NOT NULL DEFAULT (datetime('now')),
+  atualizado_em TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (loja_id, data)
+);
+
+CREATE TABLE IF NOT EXISTS fechamento_itens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fechamento_id INTEGER NOT NULL REFERENCES fechamentos(id) ON DELETE CASCADE,
+  ordem INTEGER NOT NULL,
+  nome TEXT NOT NULL,
+  valor REAL NOT NULL DEFAULT 0,
+  forma TEXT NOT NULL CHECK (forma IN ('cortesia','dinheiro','debito','credito','pix')),
+  os TEXT,
+  valor_venda REAL,
+  agendamento_id INTEGER REFERENCES agendamentos(id)
+);
+CREATE INDEX IF NOT EXISTS idx_fech_item ON fechamento_itens(fechamento_id);
+
 CREATE TABLE IF NOT EXISTS configuracoes (
   chave TEXT PRIMARY KEY,
   valor TEXT
@@ -160,6 +189,10 @@ async function migrar(db) {
   if (lj.length && !lj.includes('vagas_por_horario')) {
     await db.run('ALTER TABLE lojas ADD COLUMN vagas_por_horario INTEGER NOT NULL DEFAULT 1');
   }
+  if (lj.length && !lj.includes('meta_diaria')) {
+    await db.run('ALTER TABLE lojas ADD COLUMN meta_diaria REAL');
+    await db.run('ALTER TABLE lojas ADD COLUMN chave_pix TEXT');
+  }
 }
 
 // Bancos anteriores ao perfil Supervisor têm a restrição antiga em usuarios.perfil.
@@ -215,7 +248,7 @@ async function abrir(url, authToken) {
 async function criarUnidade(tx, loja, acesso) {
   const lojaId = (
     await tx.run(
-      'INSERT INTO lojas (nome, endereco, cidade, telefone, hora_abertura, hora_fechamento, duracao_consulta, vagas_por_horario, ativa) VALUES (?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO lojas (nome, endereco, cidade, telefone, hora_abertura, hora_fechamento, duracao_consulta, vagas_por_horario, meta_diaria, chave_pix, ativa) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
       loja.nome,
       loja.endereco ?? null,
       loja.cidade ?? null,
@@ -224,6 +257,8 @@ async function criarUnidade(tx, loja, acesso) {
       loja.hora_fechamento || '18:00',
       loja.duracao_consulta || 30,
       loja.vagas_por_horario || 1,
+      loja.meta_diaria ?? null,
+      loja.chave_pix ?? null,
       loja.ativa === false ? 0 : 1
     )
   ).lastInsertRowid;
@@ -261,7 +296,7 @@ async function popularDemo(db, hoje = new Date()) {
       bcrypt.hashSync(senha, 10)
     );
     const unidades = [
-      [{ nome: 'Óticas Diniz Centro', endereco: 'Rua Principal, 100', cidade: 'São Luís - MA', hora_abertura: '08:00', hora_fechamento: '18:00', vagas_por_horario: 2 }, 'centro@diniz.com', true],
+      [{ nome: 'Óticas Diniz Centro', endereco: 'Rua Principal, 100', cidade: 'São Luís - MA', hora_abertura: '08:00', hora_fechamento: '18:00', vagas_por_horario: 2, meta_diaria: 1000, chave_pix: 'centro@diniz.com' }, 'centro@diniz.com', true],
       [{ nome: 'Óticas Diniz Aventureiro', endereco: 'Rua Dona Francisca, 2000', cidade: 'Joinville - SC', hora_abertura: '09:00', hora_fechamento: '19:00' }, 'aventureiro@diniz.com', false],
       [{ nome: 'Óticas Diniz Shopping', endereco: 'Av. dos Holandeses, 2000', cidade: 'São Luís - MA', hora_abertura: '10:00', hora_fechamento: '22:00' }, 'shopping@diniz.com', false],
     ];
@@ -304,6 +339,19 @@ async function popularDemo(db, hoje = new Date()) {
           k % 3 === 1 ? `demo-${k}` : null
         );
       }
+    }
+
+    // Fechamentos dos últimos dias da unidade Centro
+    const consultas = [
+      ['André Luiz', 0, 'cortesia', null, null], ['Sirlene Rodrigues', 0, 'cortesia', '0657', 780], ['Sara Rodrigues', 39.9, 'debito', null, null],
+      ['Marilu Rodrigues', 39.9, 'credito', '0658', 1240], ['Letícia Bressan', 39.9, 'pix', null, null], ['Cristiane Pereira', 0, 'cortesia', null, null],
+      ['Adenir Hammes', 39.9, 'dinheiro', '0659', 560],
+    ];
+    for (let dia = 1; dia <= 3; dia++) {
+      const d = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate() - dia);
+      const fid = (await tx.run("INSERT INTO fechamentos (loja_id, data, opto, meta) VALUES (?, ?, 'Lázaro Fernando', 1000)", ids[0], iso(d))).lastInsertRowid;
+      for (const [i, [nome, valor, forma, os, venda]] of consultas.slice(0, 4 + dia).entries())
+        await tx.run('INSERT INTO fechamento_itens (fechamento_id, ordem, nome, valor, forma, os, valor_venda) VALUES (?,?,?,?,?,?,?)', fid, i + 1, nome, valor, forma, os, venda);
     }
   });
   return true;

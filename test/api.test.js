@@ -300,3 +300,58 @@ test('supervisor acompanha só as unidades escolhidas pelo administrador', async
   await adm('PUT', `/api/usuarios/${criado.corpo.id}`, { lojas: [shopping] });
   assert.deepStrictEqual((await sup('GET', '/api/lojas')).corpo.map((l) => l.id), [shopping]);
 });
+
+test('fechamento do dia: gerente lança consultas, totais e relatório', async () => {
+  const ger = await entrar('centro@diniz.com');
+  const antigo = await ger('GET', '/api/fechamentos/dia?data=2026-10-31');
+  assert.strictEqual(antigo.status, 200);
+  assert.strictEqual(antigo.corpo.itens.length, 6);
+  assert.strictEqual(antigo.corpo.fechamento.opto, 'Lázaro Fernando');
+
+  const itens = [
+    { nome: 'Cliente Cortesia', forma: 'cortesia', valor: '39,90' },
+    { nome: 'Cliente Venda', forma: 'debito', valor: '39,90', os: '0700', valor_venda: '1.200,00' },
+    { nome: 'Cliente Dinheiro', forma: 'dinheiro', valor: 39.9 },
+  ];
+  const r = await ger('PUT', '/api/fechamentos/dia', { data: '2026-11-02', opto: 'Lázaro', itens });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.corpo));
+  const t = r.corpo.totais;
+  assert.deepStrictEqual(
+    [t.consultas, t.cortesias, t.dinheiro, t.cartao, t.total, t.vendas, t.nao_vendeu, t.valor_vendas, t.meta, t.faltou_meta],
+    [3, 1, 39.9, 39.9, 79.8, 1, 2, 1200, 1000, 920.2]
+  );
+  assert.strictEqual(r.corpo.itens[0].valor, 0, 'cortesia não tem valor');
+
+  // Salvar de novo substitui as linhas do dia
+  const r2 = await ger('PUT', '/api/fechamentos/dia', { data: '2026-11-02', itens: itens.slice(1) });
+  assert.strictEqual(r2.corpo.itens.length, 2);
+  assert.strictEqual((await ger('GET', '/api/fechamentos/dia?data=2026-11-02')).corpo.totais.consultas, 2);
+
+  // Erros claros
+  const e1 = await ger('PUT', '/api/fechamentos/dia', { data: '2026-11-02', itens: [{ nome: 'X', forma: 'cheque', valor: 10 }] });
+  assert.strictEqual(e1.status, 400);
+  assert.match(e1.corpo.erro, /Linha 1/);
+  const e2 = await ger('PUT', '/api/fechamentos/dia', { data: '2026-11-02', itens: [{ nome: 'X', forma: 'debito' }] });
+  assert.match(e2.corpo.erro, /valor da consulta/);
+  assert.strictEqual((await ger('PUT', '/api/fechamentos/dia', { data: '2030-01-01', itens: [] })).status, 400);
+
+  // Recepção não lança; outra unidade fica na sua
+  assert.strictEqual((await (await entrar('rec.av@diniz.com', 'senha-forte-1'))('GET', '/api/fechamentos/dia')).status, 403);
+  const outra = await entrar('aventureiro@diniz.com');
+  const dela = await outra('GET', `/api/fechamentos/dia?loja_id=${ids.centro}&data=2026-10-31`);
+  assert.notStrictEqual(dela.corpo.loja.id, ids.centro);
+  assert.strictEqual(dela.corpo.itens.length, 0);
+  const sup = await entrar('supervisor@diniz.com');
+  const lojasSup = (await sup('GET', '/api/lojas')).corpo.map((l) => l.id);
+  const fora = (await (await entrar('admin@diniz.com'))('GET', '/api/lojas')).corpo.find((l) => !lojasSup.includes(l.id));
+  assert.strictEqual((await sup('PUT', '/api/fechamentos/dia', { loja_id: fora.id, data: '2026-11-02', itens: [] })).status, 403);
+
+  // Relatório
+  const rel = await (await entrar('admin@diniz.com'))('GET', '/api/fechamentos/relatorio?inicio=2026-10-01&fim=2026-11-02');
+  assert.strictEqual(rel.status, 200);
+  assert.strictEqual(rel.corpo.geral.dias, 4);
+  assert.ok(rel.corpo.por_unidade.some((u) => u.chave.includes('Centro')));
+  assert.ok(rel.corpo.itens.every((i) => i.forma_rotulo && i.loja_nome));
+  const relGer = await ger('GET', '/api/fechamentos/relatorio?inicio=2026-10-01&fim=2026-11-02');
+  assert.strictEqual(relGer.corpo.geral.dias, 4);
+});

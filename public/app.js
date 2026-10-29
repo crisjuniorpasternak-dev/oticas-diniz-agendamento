@@ -36,6 +36,8 @@ const ICONES = {
   link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
   webhook: '<circle cx="12" cy="6" r="2.5"/><circle cx="6" cy="17" r="2.5"/><circle cx="18" cy="17" r="2.5"/><path d="M10.8 8.2 7.2 14.8M8.5 17h7M13.2 8.2l3.6 6.6"/>',
   proximo: '<path d="m9 6 6 6-6 6"/>',
+  fechamento: '<rect x="2.5" y="6" width="19" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 9.5v5M18 9.5v5"/>',
+  lixeira: '<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>',
 };
 const icone = (n) => `<svg class="icone" viewBox="0 0 24 24" aria-hidden="true">${ICONES[n] || ''}</svg>`;
 const vazio = (texto) => `<div class="vazio">${icone('vazio')}${texto}</div>`;
@@ -162,6 +164,7 @@ function menu() {
   // [rota, nome, nome curto para a barra inferior do celular]
   const m = [['inicio', 'Início', 'Início'], ['agendamentos', 'Agendamentos', 'Agenda']];
   if (pode('agendar')) m.push(['novo', 'Novo agendamento', 'Novo']);
+  if (pode('fechamento')) m.push(['fechamento', 'Fechamento do dia', 'Caixa']);
   if (pode('relatorios')) m.push(['relatorios', 'Relatórios', 'Relatórios']);
   if (pode('usuarios') || pode('horarios') || pode('unidades')) m.push(['configuracoes', 'Configurações', 'Ajustes']);
   return m;
@@ -212,7 +215,7 @@ function renderizar() {
   const secoes = [
     ['', [m.inicio]],
     ['Agenda', [m.agendamentos, m.novo, variasUnidades() && ['unidades', 'Unidades', 'Unidades']]],
-    ['Gestão', [m.relatorios, pode('integracao') && ['configuracoes/integracao', 'Integrações', 'CRM', 'webhook'], m.configuracoes]],
+    ['Gestão', [m.fechamento, m.relatorios, pode('integracao') && ['configuracoes/integracao', 'Integrações', 'CRM', 'webhook'], m.configuracoes]],
   ].map(([t, l]) => [t, l.filter(Boolean)]);
   const atual = rota === 'configuracoes' && sub === 'integracao' ? 'configuracoes/integracao' : rota;
   const logo = `<span class="selo-logo">D</span>`;
@@ -874,6 +877,309 @@ TELAS.relatorios = async (el) => {
   carregar();
 };
 
+// ---------- Fechamento do dia ----------
+// A gerente lança as consultas do dia no modelo da planilha (valor, forma de
+// pagamento e nº da OS quando virou venda) e acompanha o relatório.
+const reais = (n) => (Number(n) || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+const numeroBR = (n) => (Number(n) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const lerReais = (t) => {
+  let v = String(t ?? '').replace(/[R$\s]/g, '');
+  if (!v) return 0;
+  if (v.includes(',')) v = v.replace(/\./g, '').replace(',', '.');
+  return Number(v) || 0;
+};
+const FORMAS_PADRAO = { cortesia: 'Cortesia', dinheiro: 'Dinheiro', debito: 'Débito máquina clínica', credito: 'Crédito máquina clínica', pix: 'Pix máquina clínica' };
+
+// Mesmo cálculo do servidor, para os totais mudarem enquanto a gerente digita
+function totaisDia(itens, meta) {
+  const soma = (f) => itens.filter(f).reduce((t, i) => t + (i.valor || 0), 0);
+  const t = {
+    consultas: itens.length,
+    cortesias: itens.filter((i) => i.forma === 'cortesia').length,
+    dinheiro: soma((i) => i.forma === 'dinheiro'),
+    cartao: soma((i) => ['debito', 'credito', 'pix'].includes(i.forma)),
+    vendas: itens.filter((i) => i.os).length,
+    valor_vendas: itens.reduce((s, i) => s + (i.valor_venda || 0), 0),
+  };
+  t.total = t.dinheiro + t.cartao;
+  t.nao_vendeu = t.consultas - t.vendas;
+  t.conversao = t.consultas ? Math.round((t.vendas / t.consultas) * 1000) / 10 : 0;
+  t.meta = meta || null;
+  t.faltou_meta = meta ? Math.max(0, meta - t.total) : null;
+  return t;
+}
+
+TELAS.fechamento = (el, sub) => {
+  const relatorio = sub === 'relatorio';
+  el.innerHTML = `<div class="cabeca"><div><h1>Fechamento do dia</h1><p class="suave">Consultas, formas de pagamento e vendas de cada unidade</p></div></div>
+    <nav class="abas"><a href="#/fechamento" class="${relatorio ? '' : 'ativo'}">Lançar dia</a><a href="#/fechamento/relatorio" class="${relatorio ? 'ativo' : ''}">Relatório</a></nav>
+    <div id="fech"></div>`;
+  (relatorio ? relatorioFechamento : lancarFechamento)($('#fech'));
+};
+
+async function lancarFechamento(el) {
+  if (!unidadeAtual()) {
+    el.innerHTML = `<div class="cartao">${vazio('Escolha uma unidade no topo da tela para lançar o fechamento. O relatório mostra todas juntas.')}</div>`;
+    return;
+  }
+  const data = estado.fechData && estado.fechData <= hoje() ? estado.fechData : hoje();
+  const r = await api('GET', `/api/fechamentos/dia?loja_id=${unidadeAtual()}&data=${data}`);
+  const formas = r.formas || FORMAS_PADRAO;
+  let itens = r.itens.map((i) => ({ ...i }));
+  let compareceram = r.compareceram;
+  let alterado = false;
+  const meta = r.fechamento ? r.fechamento.meta : r.loja.meta_diaria;
+
+  el.innerHTML = `
+    <div class="cartao fech-cabeca">
+      <div class="linha">
+        <label>Data<input type="date" id="f-data" value="${r.data}" max="${hoje()}"></label>
+        <label>Unidade<input value="${esc(r.loja.nome)}" disabled></label>
+        <label>Optometrista<input id="f-opto" value="${esc(r.fechamento?.opto || '')}" placeholder="Quem atendeu"></label>
+      </div>
+      <p class="suave fech-situacao">${
+        r.fechamento
+          ? `${icone('ok')} Fechamento salvo. Você pode corrigir e salvar de novo.`
+          : 'Este dia ainda não foi fechado.'
+      }</p>
+    </div>
+    <div id="f-sugestao"></div>
+    <div class="cartao">
+      <div class="cabeca-cartao"><h2>Consultas</h2><span class="suave">Cortesia não tem valor. Preencha o nº da OS quando a consulta virou venda.</span></div>
+      <div class="fech-grade fech-titulos" aria-hidden="true"><span>#</span><span>Nome</span><span>Valor</span><span>Forma de pagamento</span><span>Nº da OS</span><span>Valor da venda</span><span></span></div>
+      <div id="f-linhas"></div>
+      <button class="btn sec" id="f-mais" type="button">+ Adicionar consulta</button>
+    </div>
+    <div class="cartao">
+      <h2>Totais do dia</h2>
+      <div id="f-totais"></div>
+      <label>Observações<textarea id="f-obs" rows="2" placeholder="Opcional">${esc(r.fechamento?.observacoes || '')}</textarea></label>
+      <p class="erro" id="f-erro"></p>
+      <div class="acoes-fech"><button class="btn" id="f-salvar" type="button">${icone('ok')} Salvar fechamento</button></div>
+    </div>`;
+
+  const linha = (i, n) => `
+    <div class="fech-grade fech-linha" data-i="${n}">
+      <span class="fech-n">${n + 1}</span>
+      <label><span class="rotulo-cel">Nome</span><input data-c="nome" value="${esc(i.nome || '')}" placeholder="Nome do cliente"></label>
+      <label><span class="rotulo-cel">Valor</span><input data-c="valor" inputmode="decimal" value="${i.forma === 'cortesia' ? '' : i.valor ? numeroBR(i.valor) : ''}" ${i.forma === 'cortesia' ? 'disabled placeholder="—"' : 'placeholder="0,00"'}></label>
+      <label><span class="rotulo-cel">Forma</span><select data-c="forma"><option value="">Escolha</option>${Object.entries(formas)
+        .map(([k, v]) => `<option value="${k}" ${i.forma === k ? 'selected' : ''}>${v}</option>`)
+        .join('')}</select></label>
+      <label><span class="rotulo-cel">Nº da OS</span><input data-c="os" value="${esc(i.os || '')}" placeholder="Se vendeu"></label>
+      <label><span class="rotulo-cel">Valor da venda</span><input data-c="valor_venda" inputmode="decimal" value="${i.valor_venda ? numeroBR(i.valor_venda) : ''}" placeholder="Opcional"></label>
+      <button class="btn-icone" data-remover type="button" title="Remover linha" aria-label="Remover linha ${n + 1}">${icone('lixeira')}</button>
+    </div>`;
+
+  const totais = () => {
+    const t = totaisDia(itens, meta);
+    $('#f-totais', el).innerHTML = `
+      <div class="fech-totais">
+        <div><span>Consultas</span><b>${t.consultas}</b></div>
+        <div><span>Cortesias</span><b>${t.cortesias}</b></div>
+        <div><span>Pagamento em dinheiro</span><b>${reais(t.dinheiro)}</b></div>
+        <div><span>Pagamento em cartão / Pix máquina</span><b>${reais(t.cartao)}</b></div>
+        <div class="forte"><span>Total das consultas</span><b>${reais(t.total)}</b></div>
+        <div class="${t.meta ? (t.faltou_meta ? 'alerta' : 'bom') : ''}"><span>Faltou para a meta</span><b>${t.meta ? reais(t.faltou_meta) : '<small class="suave">sem meta</small>'}</b>${t.meta ? `<small>meta ${reais(t.meta)}</small>` : ''}</div>
+        <div class="bom"><span>Venderam (com OS)</span><b>${t.vendas}</b><small>${t.conversao}% das consultas</small></div>
+        <div class="alerta"><span>Não venderam</span><b>${t.nao_vendeu}</b></div>
+        <div><span>Valor vendido</span><b>${reais(t.valor_vendas)}</b></div>
+        <div><span>Faltaram ao exame</span><b>${r.faltaram}</b><small>pela agenda do dia</small></div>
+        ${r.loja.chave_pix ? `<div><span>Chave Pix</span><b class="pix">${esc(r.loja.chave_pix)}</b></div>` : ''}
+      </div>`;
+  };
+  const sugestao = () => {
+    $('#f-sugestao', el).innerHTML = compareceram.length
+      ? `<div class="cartao fech-sugestao"><div><b>${compareceram.length} cliente(s) marcados como "compareceu"</b> na agenda ainda não estão no fechamento.
+          <div class="chips">${compareceram.map((a) => `<span class="pilula">${esc(a.hora)} · ${esc(a.nome)}</span>`).join('')}</div></div>
+          <button class="btn sec" id="f-puxar" type="button">+ Adicionar todos</button></div>`
+      : '';
+    const b = $('#f-puxar', el);
+    if (b)
+      b.onclick = () => {
+        itens.push(...compareceram.map((a) => ({ nome: a.nome, valor: 0, forma: '', os: '', agendamento_id: a.id })));
+        compareceram = [];
+        alterado = true;
+        desenhar();
+      };
+  };
+  const desenhar = () => {
+    $('#f-linhas', el).innerHTML = itens.length ? itens.map(linha).join('') : '<p class="suave fech-vazio">Nenhuma consulta lançada ainda.</p>';
+    sugestao();
+    totais();
+  };
+  // Último valor cobrado, sugerido ao escolher uma forma paga
+  const ultimoValor = () => [...itens].reverse().find((i) => i.forma !== 'cortesia' && i.valor)?.valor || 0;
+
+  $('#f-linhas', el).addEventListener('input', (e) => {
+    const c = e.target.dataset.c;
+    const n = Number(e.target.closest('[data-i]')?.dataset.i);
+    if (!c || Number.isNaN(n)) return;
+    const it = itens[n];
+    alterado = true;
+    if (c === 'valor' || c === 'valor_venda') it[c] = lerReais(e.target.value);
+    else if (c === 'forma') {
+      it.forma = e.target.value;
+      const v = $('[data-c=valor]', e.target.closest('[data-i]'));
+      if (it.forma === 'cortesia') {
+        it.valor = 0;
+        v.value = '';
+        v.disabled = true;
+        v.placeholder = '—';
+      } else {
+        v.disabled = false;
+        v.placeholder = '0,00';
+        if (!it.valor && it.forma) {
+          it.valor = ultimoValor();
+          v.value = it.valor ? numeroBR(it.valor) : '';
+        }
+      }
+    } else it[c] = e.target.value;
+    totais();
+  });
+  $('#f-linhas', el).addEventListener('click', (e) => {
+    const b = e.target.closest('[data-remover]');
+    if (!b) return;
+    const n = Number(b.closest('[data-i]').dataset.i);
+    const [saiu] = itens.splice(n, 1);
+    // Quem veio da agenda volta para a sugestão
+    const a = r.compareceram.find((x) => x.id === saiu.agendamento_id);
+    if (a && !compareceram.includes(a)) compareceram.push(a);
+    alterado = true;
+    desenhar();
+  });
+  $('#f-mais', el).onclick = () => {
+    itens.push({ nome: '', valor: 0, forma: '', os: '' });
+    alterado = true;
+    desenhar();
+    $$('.fech-linha [data-c=nome]', el).pop()?.focus();
+  };
+  $('#f-data', el).onchange = (e) => {
+    if (alterado && !confirm('Há alterações não salvas neste dia. Trocar de data mesmo assim?')) {
+      e.target.value = r.data;
+      return;
+    }
+    estado.fechData = e.target.value;
+    lancarFechamento(el);
+  };
+  $('#f-opto', el).oninput = $('#f-obs', el).oninput = () => (alterado = true);
+  $('#f-salvar', el).onclick = async () => {
+    const botao = $('#f-salvar', el);
+    const erro = $('#f-erro', el);
+    erro.textContent = '';
+    botao.classList.add('carregando');
+    try {
+      const salvo = await api('PUT', '/api/fechamentos/dia', {
+        loja_id: r.loja.id,
+        data: r.data,
+        opto: $('#f-opto', el).value,
+        observacoes: $('#f-obs', el).value,
+        itens: itens.filter((i) => i.nome || i.forma || i.valor || i.os).map(({ nome, valor, forma, os, valor_venda, agendamento_id }) => ({ nome, valor, forma, os, valor_venda, agendamento_id })),
+      });
+      alterado = false;
+      avisar(`Fechamento de ${dataBR(r.data)} salvo: ${salvo.totais.consultas} consulta(s), ${reais(salvo.totais.total)}.`);
+      lancarFechamento(el);
+    } catch (e) {
+      erro.textContent = e.message;
+      erro.classList.remove('tremer');
+      void erro.offsetWidth;
+      erro.classList.add('tremer');
+    } finally {
+      botao.classList.remove('carregando');
+    }
+  };
+  desenhar();
+}
+
+async function relatorioFechamento(el) {
+  el.innerHTML = `
+    <div class="cartao"><div class="linha">
+      <label>De<input type="date" id="r-ini" value="${somarDias(hoje(), -30)}"></label>
+      <label>Até<input type="date" id="r-fim" value="${hoje()}"></label>
+    </div></div>
+    <div id="r-res"></div>`;
+  const csv = (nome, linhas) => {
+    const texto = '﻿' + linhas.map((l) => l.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(';')).join('\n');
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([texto], { type: 'text/csv;charset=utf-8' }));
+    link.download = nome;
+    link.click();
+  };
+  const carregar = async () => {
+    const q = new URLSearchParams({ inicio: $('#r-ini').value, fim: $('#r-fim').value });
+    if (unidadeAtual()) q.set('loja_id', unidadeAtual());
+    const r = await api('GET', '/api/fechamentos/relatorio?' + q);
+    const g = r.geral;
+    const tabela = (titulo, linhas, nome) => `
+      <div class="cartao tabela-rolagem"><h2>${titulo}</h2>${
+        linhas.length
+          ? `<table><thead><tr><th>${nome}</th><th>Dias</th><th>Consultas</th><th>Cortesias</th><th>Total consultas</th><th>Venderam</th><th>Não venderam</th><th>Conversão</th><th>Valor vendido</th></tr></thead><tbody>
+            ${linhas
+              .map(
+                (l) => `<tr><td><b>${esc(l.chave)}</b></td><td>${l.dias}</td><td>${l.consultas}</td><td>${l.cortesias}</td><td>${reais(l.total)}</td>
+                <td>${l.vendas}</td><td>${l.nao_vendeu}</td><td><b>${l.conversao}%</b></td><td>${reais(l.valor_vendas)}</td></tr>`
+              )
+              .join('')}</tbody></table>`
+          : vazio('Nenhum fechamento no período.')
+      }</div>`;
+    $('#r-res').innerHTML = `
+      <div class="kpis kpis-6">
+        ${kpi('Total das consultas', reais(g.total), `${reais(g.dinheiro)} em dinheiro · ${reais(g.cartao)} na máquina`, 'fechamento', 'destaque')}
+        ${kpi('Consultas', g.consultas, `${g.cortesias} cortesia(s) · ${g.dias} dia(s) fechados`, 'agendamentos')}
+        ${kpi('Venderam', g.vendas, `${g.conversao}% das consultas viraram OS`, 'ok', 't-ok')}
+        ${kpi('Não venderam', g.nao_vendeu, 'consultas sem OS', 'falta', 't-falta')}
+        ${kpi('Valor vendido', reais(g.valor_vendas), 'soma das OS informadas', 'relatorios')}
+        ${kpi('Faltou para a meta', g.meta ? reais(g.faltou_meta) : '—', g.meta ? `meta do período ${reais(g.meta)}` : 'defina a meta em Configurações › Unidades', 'inicio')}
+      </div>
+      <div class="cartao tabela-rolagem">
+        <div class="cabeca-cartao"><h2>Dias fechados</h2>
+          <div class="acoes-fech"><button class="btn sec peq" id="r-csv-dias">${icone('baixar')} Exportar resumo</button><button class="btn sec peq" id="r-csv-itens">${icone('baixar')} Exportar consultas</button></div></div>
+        ${
+          r.dias.length
+            ? `<table class="cartoes"><thead><tr><th>Data</th>${unidadeAtual() ? '' : '<th>Unidade</th>'}<th>Optometrista</th><th>Consultas</th><th>Cortesias</th><th>Total</th><th>Venderam</th><th>Faltou p/ meta</th></tr></thead><tbody>
+              ${r.dias
+                .map(
+                  (d) => `<tr class="clicavel" data-dia="${d.data}" data-loja="${d.loja_id}"><td class="c-hora" data-label="Data"><b>${dataBR(d.data)}</b></td>
+                  ${unidadeAtual() ? '' : `<td class="c-nome" data-label="Unidade">${esc(d.loja_nome)}</td>`}
+                  <td data-label="Optometrista">${esc(d.opto || '—')}</td><td data-label="Consultas">${d.consultas}</td><td data-label="Cortesias">${d.cortesias}</td>
+                  <td data-label="Total"><b>${reais(d.total)}</b></td><td data-label="Venderam">${d.vendas} (${d.conversao}%)</td><td data-label="Faltou p/ meta">${d.meta ? reais(d.faltou_meta) : '—'}</td></tr>`
+                )
+                .join('')}</tbody></table>`
+            : vazio('Nenhum fechamento no período.')
+        }
+      </div>
+      ${unidadeAtual() ? '' : tabela('Por unidade', r.por_unidade, 'Unidade')}
+      ${tabela('Por optometrista', r.por_opto, 'Optometrista')}
+      <div class="cartao tabela-rolagem"><h2>Por forma de pagamento</h2>
+        <table><thead><tr><th>Forma</th><th>Consultas</th><th>Valor</th></tr></thead><tbody>
+        ${r.por_forma.map((f) => `<tr><td>${esc(f.rotulo)}</td><td>${f.consultas}</td><td>${reais(f.valor)}</td></tr>`).join('')}</tbody></table></div>`;
+    $$('tr[data-dia]').forEach(
+      (tr) =>
+        (tr.onclick = () => {
+          estado.fechData = tr.dataset.dia;
+          if (variasUnidades()) {
+            estado.unidade = Number(tr.dataset.loja);
+            guardar('unidade', tr.dataset.loja);
+          }
+          location.hash = '#/fechamento';
+        })
+    );
+    const periodo = `${r.inicio}-a-${r.fim}`;
+    $('#r-csv-dias').onclick = () =>
+      csv(`fechamentos-${periodo}.csv`, [
+        ['Data', 'Unidade', 'Optometrista', 'Consultas', 'Cortesias', 'Dinheiro', 'Cartão/Pix máquina', 'Total', 'Venderam', 'Não venderam', 'Conversão %', 'Valor vendido', 'Meta', 'Faltou p/ meta'],
+        ...r.dias.map((d) => [dataBR(d.data), d.loja_nome, d.opto, d.consultas, d.cortesias, numeroBR(d.dinheiro), numeroBR(d.cartao), numeroBR(d.total), d.vendas, d.nao_vendeu, d.conversao, numeroBR(d.valor_vendas), d.meta ? numeroBR(d.meta) : '', d.meta ? numeroBR(d.faltou_meta) : '']),
+      ]);
+    $('#r-csv-itens').onclick = () =>
+      csv(`consultas-${periodo}.csv`, [
+        ['Data', 'Unidade', 'Optometrista', 'Item', 'Nome', 'Valor', 'Forma de pagamento', 'Nº da OS', 'Valor da venda'],
+        ...r.itens.map((i) => [dataBR(i.data), i.loja_nome, i.opto, i.ordem, i.nome, numeroBR(i.valor), i.forma_rotulo, i.os, i.valor_venda ? numeroBR(i.valor_venda) : '']),
+      ]);
+  };
+  $$('#r-ini, #r-fim').forEach((x) => (x.onchange = carregar));
+  carregar();
+}
+
 // ---------- Configurações ----------
 const ABAS = [
   ['unidades', 'Unidades', () => pode('unidades')],
@@ -928,6 +1234,10 @@ function formUnidade(l, aoSalvar) {
       <label>Nome<input name="nome" required value="${esc(l.nome || '')}" placeholder="Ex.: Óticas Diniz Aventureiro"></label>
       <label>Endereço<input name="endereco" value="${esc(l.endereco || '')}"></label>
       <div class="linha"><label>Cidade<input name="cidade" value="${esc(l.cidade || '')}"></label><label>Telefone<input name="telefone" value="${esc(l.telefone || '')}"></label></div>
+      <div class="linha">
+        <label>Meta diária de consultas (R$)<input name="meta_diaria" inputmode="decimal" value="${l.meta_diaria ? numeroBR(l.meta_diaria) : ''}" placeholder="Ex.: 1.000,00"></label>
+        <label>Chave Pix da unidade<input name="chave_pix" value="${esc(l.chave_pix || '')}"></label>
+      </div>
       ${
         nova
           ? `<div class="linha">

@@ -21,6 +21,16 @@ const falha = (status, msg) => {
   throw new ErroHttp(status, msg);
 };
 
+// Valores em reais: aceita número ou texto como "39,90", "R$ 1.234,50" ou "39.90"
+const dinheiro = (v) => {
+  if (typeof v === 'number') return Math.round(v * 100) / 100;
+  let t = String(v ?? '').replace(/[R$\s]/g, '');
+  if (!t) return 0;
+  if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.');
+  const n = Number(t);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN;
+};
+
 function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
   const app = express();
   app.disable('x-powered-by');
@@ -206,6 +216,9 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     const abre = b.hora_abertura ?? atual.hora_abertura ?? '09:00';
     const fecha = b.hora_fechamento ?? atual.hora_fechamento ?? '18:00';
     if (!agenda.horaValida(abre) || !agenda.horaValida(fecha) || abre >= fecha) falha(400, 'Horário de funcionamento inválido.');
+    const metaBruta = b.meta_diaria === undefined ? atual.meta_diaria : b.meta_diaria;
+    const meta = metaBruta === null || metaBruta === '' || metaBruta === undefined ? null : dinheiro(metaBruta);
+    if (Number.isNaN(meta) || meta < 0) falha(400, 'Meta diária inválida.');
     return {
       nome,
       endereco: b.endereco ?? atual.endereco ?? null,
@@ -215,6 +228,8 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
       hora_fechamento: fecha,
       duracao_consulta: dur,
       vagas_por_horario: vagas,
+      meta_diaria: meta,
+      chave_pix: String(b.chave_pix ?? atual.chave_pix ?? '').trim() || null,
       ativa: b.ativa === undefined ? (atual.ativa ?? 1) !== 0 : !!b.ativa,
     };
   };
@@ -247,8 +262,8 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
     if (!atual) falha(404, 'Unidade não encontrada.');
     const l = validarLoja(req.body, atual);
     await db.run(
-      'UPDATE lojas SET nome=?, endereco=?, cidade=?, telefone=?, hora_abertura=?, hora_fechamento=?, duracao_consulta=?, vagas_por_horario=?, ativa=? WHERE id=?',
-      l.nome, l.endereco, l.cidade, l.telefone, l.hora_abertura, l.hora_fechamento, l.duracao_consulta, l.vagas_por_horario, l.ativa ? 1 : 0, atual.id
+      'UPDATE lojas SET nome=?, endereco=?, cidade=?, telefone=?, hora_abertura=?, hora_fechamento=?, duracao_consulta=?, vagas_por_horario=?, meta_diaria=?, chave_pix=?, ativa=? WHERE id=?',
+      l.nome, l.endereco, l.cidade, l.telefone, l.hora_abertura, l.hora_fechamento, l.duracao_consulta, l.vagas_por_horario, l.meta_diaria, l.chave_pix, l.ativa ? 1 : 0, atual.id
     );
     await auditar(req.usuario.id, 'editar', 'unidade', atual.id, req.body);
     res.json(await db.get('SELECT * FROM lojas WHERE id = ?', atual.id));
@@ -652,6 +667,174 @@ function criarApp(db, { agora = () => new Date(), fetchImpl = fetch } = {}) {
         ...p
       ),
       por_origem: await db.all(`SELECT a.origem, ${SOMAS} FROM agendamentos a WHERE ${filtro} GROUP BY a.origem`, ...p),
+    });
+  });
+
+  // ---------- Fechamento diário ----------
+  // A gerente registra as consultas do dia (valor, forma de pagamento e OS quando
+  // virou venda), no mesmo modelo da planilha que as unidades já usam.
+  const FORMAS = { cortesia: 'Cortesia', dinheiro: 'Dinheiro', debito: 'Débito máquina clínica', credito: 'Crédito máquina clínica', pix: 'Pix máquina clínica' };
+  const MAQUINA = ['debito', 'credito', 'pix'];
+  const centavos = (n) => Math.round(n * 100) / 100;
+
+  const totaisFechamento = (itens, meta) => {
+    const soma = (f) => centavos(itens.filter(f).reduce((t, i) => t + (i.valor || 0), 0));
+    const t = {
+      consultas: itens.length,
+      cortesias: itens.filter((i) => i.forma === 'cortesia').length,
+      pagantes: itens.filter((i) => i.forma !== 'cortesia').length,
+      dinheiro: soma((i) => i.forma === 'dinheiro'),
+      cartao: soma((i) => MAQUINA.includes(i.forma)),
+      vendas: itens.filter((i) => i.os).length,
+      valor_vendas: centavos(itens.reduce((s, i) => s + (i.valor_venda || 0), 0)),
+    };
+    t.total = centavos(t.dinheiro + t.cartao);
+    t.nao_vendeu = t.consultas - t.vendas;
+    t.conversao = t.consultas ? Math.round((t.vendas / t.consultas) * 1000) / 10 : 0;
+    t.meta = meta ?? null;
+    t.faltou_meta = meta ? centavos(Math.max(0, meta - t.total)) : null;
+    return t;
+  };
+
+  const validarItem = (b, n) => {
+    const onde = `Linha ${n}`;
+    const nome = String(b.nome ?? '').trim();
+    if (!nome) falha(400, `${onde}: informe o nome do cliente.`);
+    const forma = String(b.forma ?? '').trim().toLowerCase();
+    if (!FORMAS[forma]) falha(400, `${onde}: escolha a forma de pagamento (${Object.values(FORMAS).join(', ')}).`);
+    const valor = forma === 'cortesia' ? 0 : dinheiro(b.valor);
+    if (Number.isNaN(valor) || valor < 0) falha(400, `${onde}: valor da consulta inválido.`);
+    if (forma !== 'cortesia' && !valor) falha(400, `${onde}: informe o valor da consulta ou marque como cortesia.`);
+    const os = String(b.os ?? '').trim() || null;
+    const venda = b.valor_venda === undefined || b.valor_venda === null || b.valor_venda === '' ? null : dinheiro(b.valor_venda);
+    if (Number.isNaN(venda) || venda < 0) falha(400, `${onde}: valor da venda inválido.`);
+    if (venda && !os) falha(400, `${onde}: informe o nº da OS da venda.`);
+    return { nome, forma, valor, os, valor_venda: venda, agendamento_id: Number(b.agendamento_id) || null };
+  };
+
+  const lojaDoFechamento = async (eu, lojaId) => {
+    const id = lojaInformada(eu, lojaId);
+    const loja = id && (await db.get('SELECT id, nome, cidade, meta_diaria, chave_pix FROM lojas WHERE id = ?', id));
+    if (!loja) falha(400, 'Escolha a unidade.');
+    return loja;
+  };
+
+  app.get('/api/fechamentos/dia', exigir('fechamento'), async (req, res) => {
+    const loja = await lojaDoFechamento(req.usuario, req.query.loja_id);
+    const data = agenda.dataValida(req.query.data) ? req.query.data : agenda.hojeISO(agora());
+    const f = await db.get('SELECT * FROM fechamentos WHERE loja_id = ? AND data = ?', loja.id, data);
+    const itens = f ? await db.all('SELECT * FROM fechamento_itens WHERE fechamento_id = ? ORDER BY ordem', f.id) : [];
+    const agenda_dia = await db.all(
+      `SELECT a.id, a.hora, a.status, c.nome FROM agendamentos a JOIN clientes c ON c.id = a.cliente_id
+       WHERE a.loja_id = ? AND a.data = ? AND a.status IN ('compareceu','faltou') ORDER BY a.hora`,
+      loja.id, data
+    );
+    const lancados = new Set(itens.map((i) => i.agendamento_id).filter(Boolean));
+    res.json({
+      loja,
+      data,
+      formas: FORMAS,
+      fechamento: f || null,
+      itens,
+      totais: totaisFechamento(itens, f ? f.meta : loja.meta_diaria),
+      compareceram: agenda_dia.filter((a) => a.status === 'compareceu' && !lancados.has(a.id)),
+      faltaram: agenda_dia.filter((a) => a.status === 'faltou').length,
+    });
+  });
+
+  app.put('/api/fechamentos/dia', exigir('fechamento'), async (req, res) => {
+    const eu = req.usuario;
+    const loja = await lojaDoFechamento(eu, req.body.loja_id);
+    const { data } = req.body;
+    if (!agenda.dataValida(data)) falha(400, 'Data inválida.');
+    if (data > agenda.hojeISO(agora())) falha(400, 'Não é possível fechar um dia que ainda não aconteceu.');
+    const lista = Array.isArray(req.body.itens) ? req.body.itens : falha(400, 'Envie a lista de consultas.');
+    if (lista.length > 200) falha(400, 'Limite de 200 consultas por dia.');
+    const itens = lista.map((b, i) => validarItem(b, i + 1));
+    const opto = String(req.body.opto ?? '').trim() || null;
+    const obs = String(req.body.observacoes ?? '').trim() || null;
+    const id = await db.transacao(async (tx) => {
+      const atual = await tx.get('SELECT id FROM fechamentos WHERE loja_id = ? AND data = ?', loja.id, data);
+      let fid = atual?.id;
+      if (fid) {
+        await tx.run("UPDATE fechamentos SET opto = ?, observacoes = ?, atualizado_por = ?, atualizado_em = datetime('now') WHERE id = ?", opto, obs, eu.id, fid);
+        await tx.run('DELETE FROM fechamento_itens WHERE fechamento_id = ?', fid);
+      } else {
+        fid = (
+          await tx.run('INSERT INTO fechamentos (loja_id, data, opto, observacoes, meta, atualizado_por) VALUES (?,?,?,?,?,?)', loja.id, data, opto, obs, loja.meta_diaria, eu.id)
+        ).lastInsertRowid;
+      }
+      for (const [i, it] of itens.entries()) {
+        const ag = it.agendamento_id && (await tx.get('SELECT id FROM agendamentos WHERE id = ? AND loja_id = ?', it.agendamento_id, loja.id));
+        await tx.run(
+          'INSERT INTO fechamento_itens (fechamento_id, ordem, nome, valor, forma, os, valor_venda, agendamento_id) VALUES (?,?,?,?,?,?,?,?)',
+          fid, i + 1, it.nome, it.valor, it.forma, it.os, it.valor_venda, ag ? ag.id : null
+        );
+      }
+      return fid;
+    });
+    const f = await db.get('SELECT * FROM fechamentos WHERE id = ?', id);
+    const salvos = await db.all('SELECT * FROM fechamento_itens WHERE fechamento_id = ? ORDER BY ordem', id);
+    const totais = totaisFechamento(salvos, f.meta);
+    await auditar(eu.id, 'salvar', 'fechamento', id, { loja_id: loja.id, data, consultas: totais.consultas, total: totais.total });
+    res.json({ fechamento: f, itens: salvos, totais });
+  });
+
+  // Relatório dos fechamentos por período (e unidade)
+  app.get('/api/fechamentos/relatorio', exigir('fechamento'), async (req, res) => {
+    const eu = req.usuario;
+    const hoje = agenda.hojeISO(agora());
+    const inicio = agenda.dataValida(req.query.inicio) ? req.query.inicio : agenda.somarDias(hoje, -30);
+    const fim = agenda.dataValida(req.query.fim) ? req.query.fim : hoje;
+    const [cond, pl] = condLojas(eu, 'f.loja_id', req.query.loja_id);
+    const fechamentos = await db.all(
+      `SELECT f.*, l.nome AS loja_nome FROM fechamentos f JOIN lojas l ON l.id = f.loja_id
+       WHERE f.data BETWEEN ? AND ? AND ${cond} ORDER BY f.data DESC, l.nome`,
+      inicio, fim, ...pl
+    );
+    const itens = fechamentos.length
+      ? await db.all(`SELECT * FROM fechamento_itens WHERE fechamento_id IN (${fechamentos.map(() => '?').join(',')}) ORDER BY fechamento_id, ordem`, ...fechamentos.map((f) => f.id))
+      : [];
+    const por = (chave) => {
+      const g = new Map();
+      for (const f of fechamentos) {
+        const k = chave(f);
+        if (!g.has(k)) g.set(k, { fechamentos: [], itens: [] });
+        g.get(k).fechamentos.push(f);
+      }
+      for (const i of itens) {
+        const f = fechamentos.find((x) => x.id === i.fechamento_id);
+        g.get(chave(f)).itens.push(i);
+      }
+      return [...g.entries()].map(([k, v]) => {
+        const meta = v.fechamentos.some((f) => f.meta) ? centavos(v.fechamentos.reduce((s, f) => s + (f.meta || 0), 0)) : null;
+        return { chave: k, dias: v.fechamentos.length, ...totaisFechamento(v.itens, meta) };
+      });
+    };
+    const metaGeral = fechamentos.some((f) => f.meta) ? centavos(fechamentos.reduce((s, f) => s + (f.meta || 0), 0)) : null;
+    res.json({
+      inicio,
+      fim,
+      formas: FORMAS,
+      geral: { dias: fechamentos.length, ...totaisFechamento(itens, metaGeral) },
+      por_unidade: por((f) => f.loja_nome).sort((a, b) => b.total - a.total),
+      por_opto: por((f) => f.opto || 'Não informado').sort((a, b) => b.consultas - a.consultas),
+      por_forma: Object.entries(FORMAS).map(([forma, rotulo]) => {
+        const d = itens.filter((i) => i.forma === forma);
+        return { forma, rotulo, consultas: d.length, valor: centavos(d.reduce((s, i) => s + i.valor, 0)) };
+      }),
+      dias: fechamentos.map((f) => ({
+        id: f.id,
+        data: f.data,
+        loja_id: f.loja_id,
+        loja_nome: f.loja_nome,
+        opto: f.opto,
+        ...totaisFechamento(itens.filter((i) => i.fechamento_id === f.id), f.meta),
+      })),
+      itens: itens.map((i) => {
+        const f = fechamentos.find((x) => x.id === i.fechamento_id);
+        return { ...i, data: f.data, loja_nome: f.loja_nome, opto: f.opto, forma_rotulo: FORMAS[i.forma] };
+      }),
     });
   });
 

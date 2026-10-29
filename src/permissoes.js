@@ -3,7 +3,8 @@
 //   (o primeiro) também gerencia outros administradores e vê os logs.
 // - Supervisor: acompanha as unidades que o administrador escolher; vê a agenda,
 //   os relatórios e os horários delas e cadastra gerentes e recepção.
-// - Gerente: responsável pela unidade; vê só a sua unidade e cadastra a recepção.
+// - Gerente: responsável pela unidade; vê só a sua unidade, cadastra a recepção
+//   e preenche o fechamento diário (consultas, pagamentos e vendas).
 // - Atendente (recepção): vê a agenda da unidade e marca presença.
 // Criar, remarcar e cancelar agendamentos depende da permissão "pode_agendar",
 // que só o administrador libera para cada usuário.
@@ -38,6 +39,7 @@ function permissoes(u) {
     agendar: podeAgendar(u),
     marcar_presenca: true,
     relatorios: gerencia(u),
+    fechamento: gerencia(u),
     usuarios: perfisGerenciaveis(u).length > 0,
     unidades: ehAdmin(u),
     horarios: gerencia(u),

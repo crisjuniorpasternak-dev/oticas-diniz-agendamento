@@ -39,6 +39,18 @@ Na primeira execução local o banco (`dados/agendamentos.db`) é criado com 3 u
 
 O administrador principal é o primeiro administrador (criado por `ADMIN_EMAIL`/`ADMIN_SENHA`).
 
+## Fechamento do dia
+
+A gerente da unidade (e também supervisor e administrador, nas unidades que veem) lança em **Fechamento do dia** as consultas de cada dia, no mesmo modelo da planilha: optometrista, nome do cliente, valor, forma de pagamento (cortesia, dinheiro, débito, crédito ou Pix na máquina da clínica), nº da OS quando a consulta virou venda e, opcionalmente, o valor da venda. Quem foi marcado como "compareceu" na agenda aparece como sugestão para entrar no fechamento.
+
+Os totais seguem a planilha: consultas, cortesias, pagamento em dinheiro, em cartão/Pix máquina, total, quanto faltou para a meta diária da unidade e a chave Pix (meta e chave ficam em Configurações › Unidades). Também mostra quantas consultas venderam (com OS), quantas não venderam e o valor vendido.
+
+A aba **Relatório** soma os fechamentos por período, unidade, optometrista e forma de pagamento, e exporta em CSV o resumo por dia e as consultas linha a linha.
+
+- `GET /api/fechamentos/dia?loja_id=&data=`: fechamento do dia, totais e quem compareceu na agenda.
+- `PUT /api/fechamentos/dia`: `{ loja_id, data, opto, observacoes, itens: [{ nome, valor, forma, os, valor_venda, agendamento_id }] }` substitui as linhas do dia.
+- `GET /api/fechamentos/relatorio?inicio=&fim=&loja_id=`.
+
 ## Integração com o CRM
 
 Em **Integrações** (menu lateral):

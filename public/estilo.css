@@ -706,6 +706,52 @@ select.pilula { padding-right: var(--e-5); cursor: pointer; }
 /* Computador grande: 1280px+ usa a base inteira */
 
 /* Notebook e tablet na horizontal: 1024–1279px */
+/* ---------- Fechamento do dia ---------- */
+.cabeca-cartao { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--e-2) var(--e-4); margin-bottom: var(--e-3); }
+.cabeca-cartao h2 { margin: 0; }
+.fech-situacao { display: flex; align-items: center; gap: var(--e-2); margin: var(--e-2) 0 0; }
+.fech-situacao .icone { color: var(--cor-sucesso); }
+.fech-grade { display: grid; grid-template-columns: 28px minmax(160px, 2fr) 110px minmax(150px, 1.4fr) 100px 120px 36px; gap: var(--e-2); align-items: center; }
+.fech-titulos { font-size: .68rem; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--texto-suave); padding: 0 0 var(--e-2); border-bottom: 1px solid var(--borda); }
+.fech-linha { padding: var(--e-2) 0; border-bottom: 1px solid var(--borda); animation: entrar var(--medio) var(--suave-saida); }
+.fech-linha label { margin: 0; }
+.fech-linha input, .fech-linha select { width: 100%; min-height: 38px; }
+.fech-n { color: var(--texto-suave); font-weight: 600; font-variant-numeric: tabular-nums; text-align: center; }
+.rotulo-cel { display: none; }
+.fech-vazio { padding: var(--e-4) 0; }
+#f-mais { margin-top: var(--e-3); }
+.btn-icone { display: grid; place-items: center; width: 36px; height: 36px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--texto-suave); cursor: pointer; transition: background var(--rapido), color var(--rapido); }
+.btn-icone:hover, .btn-icone:focus-visible { background: var(--cor-erro-claro); color: var(--cor-erro); }
+.btn-icone .icone { width: 18px; height: 18px; }
+.fech-sugestao { display: flex; align-items: center; justify-content: space-between; gap: var(--e-4); background: var(--cor-info-claro); }
+.chips { display: flex; flex-wrap: wrap; gap: var(--e-1); margin-top: var(--e-2); }
+.fech-totais { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: var(--e-2); margin-bottom: var(--e-4); }
+.fech-totais > div { border: 1px solid var(--borda); border-radius: var(--r-sm); padding: var(--e-3); background: var(--superficie-2); }
+.fech-totais span { display: block; font-size: .72rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--texto-suave); }
+.fech-totais b { display: block; font-size: 1.25rem; font-weight: 750; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.fech-totais small { color: var(--texto-suave); font-size: .76rem; }
+.fech-totais .forte { background: var(--marca-clara); border-color: transparent; }
+.fech-totais .forte b { color: var(--marca-texto); }
+.fech-totais .bom b { color: var(--cor-sucesso); }
+.fech-totais .alerta b { color: var(--cor-aviso); }
+.fech-totais b.pix { font-size: 1rem; word-break: break-all; }
+.acoes-fech { display: flex; flex-wrap: wrap; gap: var(--e-2); }
+
+@media (max-width: 1023px) {
+  .fech-titulos { display: none; }
+  .fech-grade.fech-linha { grid-template-columns: 1fr 1fr; position: relative; padding: var(--e-3); margin-bottom: var(--e-3); border: 1px solid var(--borda); border-radius: var(--r-md); }
+  .fech-linha .fech-n { position: absolute; top: var(--e-2); left: var(--e-3); font-size: .75rem; }
+  .fech-linha label:nth-of-type(1) { grid-column: 1 / -1; padding-top: var(--e-3); }
+  .fech-linha [data-remover] { position: absolute; top: 4px; right: 4px; }
+  .rotulo-cel { display: block; font-size: .72rem; font-weight: 600; color: var(--texto-suave); margin-bottom: 2px; }
+  .fech-sugestao { flex-direction: column; align-items: stretch; }
+}
+@media (max-width: 767px) {
+  .fech-totais { grid-template-columns: 1fr 1fr; }
+  .fech-totais b { font-size: 1.05rem; }
+  .acoes-fech .btn { flex: 1; }
+}
+
 @media (max-width: 1279px) {
   main { padding: var(--e-5); }
   .barra { padding: 0 var(--e-5); }
